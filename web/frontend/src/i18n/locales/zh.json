@@ -118,7 +118,9 @@
       "apikey": "API Key",
       "oauth": "OAuth",
       "local": "本地模型"
-    }
+    },
+    "queuedBadge": "排队中 · {{depth}}",
+    "failedBadge": "未送达"
   },
   "header": {
     "logout": {
