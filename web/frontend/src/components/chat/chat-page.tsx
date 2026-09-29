@@ -420,6 +420,9 @@ export function ChatPage() {
                     content={msg.content}
                     attachments={msg.attachments}
                     timestamp={msg.timestamp}
+                    queued={msg.queued}
+                    queueDepth={msg.queueDepth}
+                    failed={msg.failed}
                   />
                 )}
               </div>

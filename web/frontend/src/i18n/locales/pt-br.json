@@ -118,7 +118,9 @@
       "apikey": "API Key",
       "oauth": "OAuth",
       "local": "Local"
-    }
+    },
+    "queuedBadge": "na fila · {{depth}}",
+    "failedBadge": "não entregue"
   },
   "header": {
     "logout": {

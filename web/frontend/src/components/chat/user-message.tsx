@@ -11,12 +11,18 @@ interface UserMessageProps {
   content: string
   attachments?: ChatAttachment[]
   timestamp?: string | number
+  queued?: boolean
+  queueDepth?: number
+  failed?: boolean
 }
 
 export function UserMessage({
   content,
   attachments = [],
   timestamp = "",
+  queued = false,
+  queueDepth,
+  failed = false,
 }: UserMessageProps) {
   const { t } = useTranslation()
   const { copy, isCopied } = useCopyToClipboard()
@@ -88,6 +94,19 @@ export function UserMessage({
             )}
           </Button>
         </div>
+      )}
+
+      {(failed || queued) && (
+        <span
+          className={cn(
+            "px-1 text-[12px]",
+            failed ? "text-red-500 dark:text-red-400" : "text-zinc-400",
+          )}
+        >
+          {failed
+            ? t("chat.failedBadge")
+            : t("chat.queuedBadge", { depth: queueDepth ?? 0 })}
+        </span>
       )}
 
       {formattedTimestamp && (
