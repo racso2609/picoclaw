@@ -120,7 +120,8 @@
       "local": "Local"
     },
     "queuedBadge": "na fila · {{depth}}",
-    "failedBadge": "não entregue"
+    "failedBadge": "não entregue",
+    "retryBadge": "Tentar novamente"
   },
   "header": {
     "logout": {

@@ -118,7 +118,8 @@
       "local": "Lokální"
     },
     "queuedBadge": "ve frontě · {{depth}}",
-    "failedBadge": "nedoručeno"
+    "failedBadge": "nedoručeno",
+    "retryBadge": "Zkusit znovu"
   },
   "header": {
     "logout": {
