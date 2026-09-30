@@ -119,7 +119,8 @@
       "local": "লোকাল"
     },
     "queuedBadge": "সারিতে · {{depth}}",
-    "failedBadge": "পৌঁছায়নি"
+    "failedBadge": "পৌঁছায়নি",
+    "retryBadge": "পুনরায় চেষ্টা করুন"
   },
   "header": {
     "logout": {

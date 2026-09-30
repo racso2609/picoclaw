@@ -135,6 +135,7 @@ export function ChatPage() {
     activeSessionId,
     contextUsage,
     sendMessage,
+    retryMessage,
     switchSession,
     newChat,
   } = usePicoChat()
@@ -440,6 +441,7 @@ export function ChatPage() {
                     queued={msg.queued}
                     queueDepth={msg.queueDepth}
                     failed={msg.failed}
+                    onRetry={() => void retryMessage(msg.id)}
                   />
                 )}
               </div>
