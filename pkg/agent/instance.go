@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/isolation"
@@ -30,6 +31,7 @@ type AgentInstance struct {
 	Fallbacks                 []string
 	Workspace                 string
 	MaxIterations             int
+	TurnTimeBudget            time.Duration
 	MaxTokens                 int
 	Temperature               float64
 	ThinkingLevel             ThinkingLevel
@@ -194,6 +196,8 @@ func NewAgentInstance(
 		maxIter = 20
 	}
 
+	turnTimeBudget := time.Duration(defaults.TurnTimeBudgetSeconds) * time.Second
+
 	maxTokens := defaults.MaxTokens
 	if maxTokens == 0 {
 		maxTokens = 8192
@@ -328,6 +332,7 @@ func NewAgentInstance(
 		Fallbacks:                 fallbacks,
 		Workspace:                 workspace,
 		MaxIterations:             maxIter,
+		TurnTimeBudget:            turnTimeBudget,
 		MaxTokens:                 maxTokens,
 		Temperature:               temperature,
 		ThinkingLevel:             thinkingLevel,
