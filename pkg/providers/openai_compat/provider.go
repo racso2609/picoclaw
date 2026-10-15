@@ -149,8 +149,13 @@ func (p *Provider) buildRequestBody(
 	model = normalizeModel(model, p.apiBase)
 
 	requestBody := map[string]any{
-		"model":    model,
-		"messages": common.SerializeMessages(p.prepareMessagesForRequest(messages)),
+		"model": model,
+		"messages": common.SerializeMessagesWithOptions(
+			p.prepareMessagesForRequest(messages),
+			common.SerializeOptions{
+				GeminiThoughtSignatureFallback: isGeminiHost(p.apiBase),
+			},
+		),
 	}
 
 	// When fallback uses a different provider (e.g. DeepSeek), that provider must not inject web_search_preview.
@@ -374,6 +379,15 @@ func isMiMoHost(apiBase string) bool {
 	}
 	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
 	return host == "xiaomimimo.com" || strings.HasSuffix(host, ".xiaomimimo.com")
+}
+
+// isGeminiHost reports whether the endpoint is Google's Gemini API (native or
+// OpenAI-compatible). Gemini 3 requires every functionCall part to carry a
+// thought_signature; requests with unsigned parts are rejected with HTTP 400.
+func isGeminiHost(apiBase string) bool {
+	host := normalizedHostname(apiBase)
+	return host == "generativelanguage.googleapis.com" ||
+		strings.HasSuffix(host, ".generativelanguage.googleapis.com")
 }
 
 func filterReasoningReplayMessages(messages []Message) []Message {

@@ -2242,3 +2242,44 @@ func TestProviderChatStream_CapturesGeminiThoughtSignature(t *testing.T) {
 		)
 	}
 }
+
+// Gemini endpoints must serialize unsigned tool calls with the documented
+// sentinel so Gemini 3 does not reject the request with HTTP 400. Non-Gemini
+// endpoints must keep omitting extra_content for signature-less tool calls.
+func TestBuildRequestBody_GeminiInjectsThoughtSignatureSentinel(t *testing.T) {
+	messages := []Message{
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{
+				{
+					ID:        "call_1",
+					Type:      "function",
+					Name:      "get_weather",
+					Arguments: map[string]any{"city": "Caracas"},
+				},
+			},
+		},
+	}
+
+	gemini := NewProvider("key", "https://generativelanguage.googleapis.com/v1beta/openai/", "")
+	gemini.SetProviderName("openai")
+	body := gemini.buildRequestBody(messages, nil, "gemini-3.8-flash", nil)
+	raw, err := json.Marshal(body["messages"])
+	if err != nil {
+		t.Fatalf("marshal messages: %v", err)
+	}
+	if !strings.Contains(string(raw), "skip_thought_signature_validator") {
+		t.Fatalf("expected sentinel thought_signature for Gemini endpoint, got %s", string(raw))
+	}
+
+	other := NewProvider("key", "https://api.cheaperinference.com/v1", "")
+	other.SetProviderName("openai")
+	body = other.buildRequestBody(messages, nil, "deepseek-v4.1-flash", nil)
+	raw, err = json.Marshal(body["messages"])
+	if err != nil {
+		t.Fatalf("marshal messages: %v", err)
+	}
+	if strings.Contains(string(raw), "extra_content") {
+		t.Fatalf("did not expect extra_content for non-Gemini endpoint, got %s", string(raw))
+	}
+}

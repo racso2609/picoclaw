@@ -891,3 +891,101 @@ func TestSerializeMessages_ToolCallWithoutSignatureOmitsExtraContent(t *testing.
 		t.Fatalf("did not expect extra_content for signature-less tool call, got %s", string(data))
 	}
 }
+
+// --- Gemini sentinel fallback tests ---
+
+// When a tool call has no captured signature (e.g. the turn started on another
+// provider and later fell back to Gemini), the serializer must inject the
+// documented sentinel inside extra_content.google.thought_signature so Gemini 3
+// accepts the request instead of returning HTTP 400.
+func TestSerializeMessagesWithOptions_GeminiFallbackInjectsSentinel(t *testing.T) {
+	messages := []Message{
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{
+				{
+					ID:        "call_9",
+					Type:      "function",
+					Name:      "get_weather",
+					Arguments: map[string]any{"city": "Caracas"},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(SerializeMessagesWithOptions(
+		messages,
+		SerializeOptions{GeminiThoughtSignatureFallback: true},
+	))
+	if err != nil {
+		t.Fatalf("marshal error = %v", err)
+	}
+	got := string(data)
+
+	want := `"extra_content":{"google":{"thought_signature":"` + GeminiThoughtSignatureSentinel + `"}}`
+	if !strings.Contains(got, want) {
+		t.Fatalf("expected sentinel extra_content %s in wire payload, got %s", want, got)
+	}
+}
+
+// A real captured signature must never be replaced by the sentinel.
+func TestSerializeMessagesWithOptions_GeminiFallbackKeepsRealSignature(t *testing.T) {
+	messages := []Message{
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{
+				{
+					ID:   "call_10",
+					Type: "function",
+					Function: &FunctionCall{
+						Name:             "get_weather",
+						Arguments:        `{"city":"Caracas"}`,
+						ThoughtSignature: "real-sig",
+					},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(SerializeMessagesWithOptions(
+		messages,
+		SerializeOptions{GeminiThoughtSignatureFallback: true},
+	))
+	if err != nil {
+		t.Fatalf("marshal error = %v", err)
+	}
+	got := string(data)
+
+	if !strings.Contains(got, `"thought_signature":"real-sig"`) {
+		t.Fatalf("expected real signature preserved, got %s", got)
+	}
+	if strings.Contains(got, GeminiThoughtSignatureSentinel) {
+		t.Fatalf("sentinel must not override a real signature, got %s", got)
+	}
+}
+
+// Without the option the legacy behavior is preserved: no signature, no
+// extra_content block.
+func TestSerializeMessagesWithOptions_NoGeminiFallbackOmitsExtraContent(t *testing.T) {
+	messages := []Message{
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{
+				{
+					ID:        "call_11",
+					Type:      "function",
+					Name:      "ping",
+					Arguments: map[string]any{},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(SerializeMessagesWithOptions(messages, SerializeOptions{}))
+	if err != nil {
+		t.Fatalf("marshal error = %v", err)
+	}
+	if strings.Contains(string(data), "extra_content") {
+		t.Fatalf("did not expect extra_content without Gemini fallback, got %s", string(data))
+	}
+}
