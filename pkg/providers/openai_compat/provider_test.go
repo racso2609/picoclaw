@@ -2196,3 +2196,49 @@ func TestSerializeMessages_StripsSystemParts(t *testing.T) {
 		t.Fatal("system_parts should not appear in serialized output")
 	}
 }
+
+// Gemini 3 streams the thought_signature inside extra_content.google on the
+// tool_call delta. It must be captured so it can be echoed back on the next
+// request, otherwise Gemini returns HTTP 400.
+func TestProviderChatStream_CapturesGeminiThoughtSignature(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"extra_content\":{\"google\":{\"thought_signature\":\"sig-stream\"}},\"function\":{\"arguments\":\"{\\\"city\\\":\\\"Caracas\\\"}\",\"name\":\"get_weather\"},\"id\":\"call_1\",\"type\":\"function\"}]},\"index\":0}]}\n\n",
+		))
+		_, _ = w.Write([]byte(
+			"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"index\":0}]}\n\n",
+		))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	out, err := p.ChatStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "weather?"}},
+		nil,
+		"gemini-3.8-flash",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(out.ToolCalls))
+	}
+	if out.ToolCalls[0].ThoughtSignature != "sig-stream" {
+		t.Fatalf("ToolCalls[0].ThoughtSignature = %q, want %q", out.ToolCalls[0].ThoughtSignature, "sig-stream")
+	}
+	if out.ToolCalls[0].ExtraContent == nil || out.ToolCalls[0].ExtraContent.Google == nil {
+		t.Fatal("ToolCalls[0].ExtraContent.Google is nil")
+	}
+	if out.ToolCalls[0].ExtraContent.Google.ThoughtSignature != "sig-stream" {
+		t.Fatalf(
+			"ToolCalls[0].ExtraContent.Google.ThoughtSignature = %q, want %q",
+			out.ToolCalls[0].ExtraContent.Google.ThoughtSignature,
+			"sig-stream",
+		)
+	}
+}

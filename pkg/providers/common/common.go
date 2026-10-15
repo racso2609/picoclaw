@@ -78,9 +78,23 @@ type openaiMessage struct {
 }
 
 type openaiToolCall struct {
-	ID       string              `json:"id"`
-	Type     string              `json:"type,omitempty"`
-	Function *openaiFunctionCall `json:"function,omitempty"`
+	ID           string              `json:"id"`
+	Type         string              `json:"type,omitempty"`
+	Function     *openaiFunctionCall `json:"function,omitempty"`
+	ExtraContent *openaiExtraContent `json:"extra_content,omitempty"`
+}
+
+// openaiExtraContent carries provider-specific metadata on a tool call.
+// Google/Gemini 3 requires the thought_signature to be echoed back inside
+// extra_content.google.thought_signature on every functionCall part;
+// sending it only under function.thought_signature is rejected with HTTP 400
+// ("Function call is missing a thought_signature in functionCall parts").
+type openaiExtraContent struct {
+	Google *openaiGoogleExtra `json:"google,omitempty"`
+}
+
+type openaiGoogleExtra struct {
+	ThoughtSignature string `json:"thought_signature,omitempty"`
 }
 
 type openaiFunctionCall struct {
@@ -168,24 +182,25 @@ func serializeToolCalls(toolCalls []ToolCall) []openaiToolCall {
 			Type: tc.Type,
 		}
 
+		// Resolve the Gemini 3 thought signature from every known location.
+		// It must be echoed back inside extra_content.google.thought_signature
+		// (Gemini rejects requests where it only appears under
+		// function.thought_signature with HTTP 400).
+		thoughtSignature := tc.ThoughtSignature
+		if tc.Function != nil && tc.Function.ThoughtSignature != "" {
+			thoughtSignature = tc.Function.ThoughtSignature
+		}
+		if thoughtSignature == "" && tc.ExtraContent != nil && tc.ExtraContent.Google != nil {
+			thoughtSignature = tc.ExtraContent.Google.ThoughtSignature
+		}
+
 		if tc.Function != nil {
-			thoughtSignature := tc.Function.ThoughtSignature
-			if thoughtSignature == "" {
-				thoughtSignature = tc.ThoughtSignature
-			}
-			if thoughtSignature == "" && tc.ExtraContent != nil && tc.ExtraContent.Google != nil {
-				thoughtSignature = tc.ExtraContent.Google.ThoughtSignature
-			}
 			wireCall.Function = &openaiFunctionCall{
 				Name:             tc.Function.Name,
 				Arguments:        tc.Function.Arguments,
 				ThoughtSignature: thoughtSignature,
 			}
-		} else if tc.Name != "" || len(tc.Arguments) > 0 || tc.ThoughtSignature != "" {
-			thoughtSignature := tc.ThoughtSignature
-			if thoughtSignature == "" && tc.ExtraContent != nil && tc.ExtraContent.Google != nil {
-				thoughtSignature = tc.ExtraContent.Google.ThoughtSignature
-			}
+		} else if tc.Name != "" || len(tc.Arguments) > 0 || thoughtSignature != "" {
 			argsJSON := "{}"
 			if len(tc.Arguments) > 0 {
 				if encoded, err := json.Marshal(tc.Arguments); err == nil {
@@ -196,6 +211,12 @@ func serializeToolCalls(toolCalls []ToolCall) []openaiToolCall {
 				Name:             tc.Name,
 				Arguments:        argsJSON,
 				ThoughtSignature: thoughtSignature,
+			}
+		}
+
+		if thoughtSignature != "" {
+			wireCall.ExtraContent = &openaiExtraContent{
+				Google: &openaiGoogleExtra{ThoughtSignature: thoughtSignature},
 			}
 		}
 
