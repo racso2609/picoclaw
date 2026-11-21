@@ -1,11 +1,21 @@
 # Do NOT exclude LICENSE or .github — scripts/copydir.go uses them as repo-root anchors
 # during `go generate`, which runs inside `make build` in the Dockerfile.
+# Do NOT exclude workspace/ — it is embedded via //go:embed.
 .git
 .gitignore
+.git-rewrite/
 build/
 .picoclaw/
 config/
 .env
 .env.example
 *.md
+*.log
 assets/
+# Local Go caches (1.7 GB). The Dockerfile pins GOCACHE/GOMODCACHE to
+# /root/.cache/go-build and /go/pkg/mod, so these are never needed in the
+# build context.
+.cache/
+.artifacts/
+node_modules/
+*.bak*
