@@ -499,7 +499,12 @@ func (p *Provider) Chat(
 		return nil, common.HandleErrorResponse(resp, p.apiBase)
 	}
 
-	return common.ReadAndParseResponse(resp, p.apiBase)
+	parsed, err := common.ReadAndParseResponse(resp, p.apiBase)
+	if err != nil {
+		return nil, err
+	}
+	recovered, _ := common.RecoverDSMLToolCalls(parsed)
+	return recovered, nil
 }
 
 // ChatStream implements streaming via OpenAI-compatible SSE (stream: true).
@@ -801,7 +806,7 @@ func parseStreamResponse(
 		finishReason = "stop"
 	}
 
-	return &LLMResponse{
+	recovered, _ := common.RecoverDSMLToolCalls(&LLMResponse{
 		Content:          textContent.String(),
 		ReasoningContent: reasoningContent.String(),
 		Reasoning:        reasoning.String(),
@@ -809,7 +814,8 @@ func parseStreamResponse(
 		ToolCalls:        toolCalls,
 		FinishReason:     finishReason,
 		Usage:            usage,
-	}, nil
+	})
+	return recovered, nil
 }
 
 func normalizeModel(model, apiBase string) string {
