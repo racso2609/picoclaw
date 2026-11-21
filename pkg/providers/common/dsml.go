@@ -381,6 +381,12 @@ func findTagEnd(s string, start int) int {
 		c := s[i]
 		switch {
 		case quote != 0:
+			// Honour backslash escapes so `label="a\"b"` does not end the
+			// value early and swallow the rest of the tag.
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
 			if c == quote {
 				quote = 0
 			}

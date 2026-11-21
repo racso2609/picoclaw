@@ -390,3 +390,21 @@ func TestRecoverDSMLToolCalls_UniqueIDsWithinBlock(t *testing.T) {
 		t.Fatalf("tool call IDs must be unique, both are %q", resp.ToolCalls[0].ID)
 	}
 }
+
+// TestRecoverDSMLToolCalls_EscapedQuoteInAttributeValue covers a backslash
+// escaped quote inside an attribute value. Without the escape handling in
+// findTagEnd the quote closes the value early, the tag never terminates and the
+// whole call is lost.
+func TestRecoverDSMLToolCalls_EscapedQuoteInAttributeValue(t *testing.T) {
+	param := "<" + fw + fw + "DSML" + fw + fw + "parameter" + ` label="a\"b" name="command" string="true">ls</` +
+		fw + fw + "DSML" + fw + fw + "parameter>"
+	content := dsmlCanonical(dsmlInvoke("exec", param))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatalf("an escaped quote inside an attribute value must not lose the call")
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "ls" {
+		t.Fatalf("command = %v, want ls (args %v)", got, resp.ToolCalls[0].Arguments)
+	}
+}
