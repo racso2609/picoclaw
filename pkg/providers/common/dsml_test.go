@@ -225,6 +225,35 @@ func TestRecoverDSMLToolCalls_UnterminatedBlockIsLeftAlone(t *testing.T) {
 	}
 }
 
+// TestRecoverDSMLToolCalls_UnterminatedBlockDoesNotSwallowFollowingBlock is the
+// falsifiable counterpart of the test above. A valid block followed by an
+// unterminated one must recover exactly one call and leave the trailing markup
+// visible. Reverting the "stop here rather than swallow the rest" guard in
+// findDSMLBlocks (e.g. returning early or dropping the block) breaks this.
+func TestRecoverDSMLToolCalls_UnterminatedBlockDoesNotSwallowFollowingBlock(t *testing.T) {
+	valid := dsmlCanonical(dsmlInvoke("exec", dsmlParam("command", "echo ok", true)))
+	unterminated := "<" + fw + fw + "DSML" + fw + fw + "tool_calls>\n" +
+		dsmlInvoke("exec", dsmlParam("command", "echo broken", true))
+	content := valid + "\n\n" + unterminated
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatalf("the valid block must be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo ok" {
+		t.Fatalf("recovered command = %v, want 'echo ok'", got)
+	}
+	if !strings.Contains(resp.Content, "echo broken") {
+		t.Fatalf("unterminated markup must stay visible, got %q", resp.Content)
+	}
+	if strings.Contains(resp.Content, "echo ok") {
+		t.Fatalf("the recovered block must be stripped from content, got %q", resp.Content)
+	}
+}
+
 func TestRecoverDSMLToolCalls_InvokeWithoutParametersIsSkipped(t *testing.T) {
 	content := dsmlCanonical(dsmlInvoke("exec", ""))
 
@@ -276,5 +305,88 @@ func TestRecoverDSMLToolCalls_StringParamKeptVerbatim(t *testing.T) {
 	}
 	if got != `{"a":1}` {
 		t.Fatalf("command = %q, want the verbatim JSON text", got)
+	}
+}
+
+// TestRecoverDSMLToolCalls_IgnoresMarkupInsideTildeFence covers the tilde fence
+// form, which the first version of maskCodeRegions did not recognise at all.
+func TestRecoverDSMLToolCalls_IgnoresMarkupInsideTildeFence(t *testing.T) {
+	content := "~~~\n" + dsmlCanonical(dsmlInvoke("exec", dsmlParam("command", "rm -rf /", true))) + "\n~~~"
+	if _, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content}); ok {
+		t.Fatalf("must not execute markup inside a tilde fence")
+	}
+}
+
+// TestRecoverDSMLToolCalls_ClosingFenceMustBeAtLeastAsLong covers fences whose
+// closing run is shorter than the opener: CommonMark does not close the block
+// there, so the content stays inside the fence and must not execute.
+func TestRecoverDSMLToolCalls_ClosingFenceMustBeAtLeastAsLong(t *testing.T) {
+	blk := dsmlCanonical(dsmlInvoke("exec", dsmlParam("command", "rm -rf /", true)))
+	for _, content := range []string{
+		"````\n" + blk + "\n```",
+		"`````\n" + blk + "\n```",
+		"~~~~\n" + blk + "\n~~~",
+	} {
+		if _, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content}); ok {
+			t.Fatalf("must not execute markup inside an unclosed fence: %q", content)
+		}
+	}
+}
+
+// TestRecoverDSMLToolCalls_UnterminatedFenceMasksRest covers the "model opens a
+// fence and never closes it" case: everything after the opener is fenced.
+func TestRecoverDSMLToolCalls_UnterminatedFenceMasksRest(t *testing.T) {
+	content := "```\n" + dsmlCanonical(dsmlInvoke("exec", dsmlParam("command", "rm -rf /", true)))
+	if _, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content}); ok {
+		t.Fatalf("must not execute markup inside an unterminated fence")
+	}
+}
+
+// TestRecoverDSMLToolCalls_AttributeValueWithGT covers a '>' inside a quoted
+// attribute value, which used to truncate the tag and lose the whole call.
+func TestRecoverDSMLToolCalls_AttributeValueWithGT(t *testing.T) {
+	param := "<" + fw + fw + "DSML" + fw + fw + "parameter" + ` label="a>b" name="command" string="true">ls</` +
+		fw + fw + "DSML" + fw + fw + "parameter>"
+	content := dsmlCanonical(dsmlInvoke("exec", param))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatalf("a '>' inside an attribute value must not lose the call")
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "ls" {
+		t.Fatalf("command = %v, want ls", got)
+	}
+}
+
+// TestRecoverDSMLToolCalls_AttributeNameInsideValue covers a parameter named
+// "name" appearing inside another attribute's value; the real name attribute
+// must win.
+func TestRecoverDSMLToolCalls_AttributeNameInsideValue(t *testing.T) {
+	param := "<" + fw + fw + "DSML" + fw + fw + "parameter" + ` label="name=foo" name="command" string="true">ls</` +
+		fw + fw + "DSML" + fw + fw + "parameter>"
+	content := dsmlCanonical(dsmlInvoke("exec", param))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatalf("an attribute name inside a value must not lose the call")
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "ls" {
+		t.Fatalf("command = %v, want ls (got args %v)", got, resp.ToolCalls[0].Arguments)
+	}
+}
+
+// TestRecoverDSMLToolCalls_UniqueIDsWithinBlock guards the fallback path used
+// when the RNG fails: IDs must stay unique so the history is not corrupted.
+func TestRecoverDSMLToolCalls_UniqueIDsWithinBlock(t *testing.T) {
+	content := dsmlCanonical(
+		dsmlInvoke("exec", dsmlParam("command", "ls", true)) + "\n" +
+			dsmlInvoke("exec", dsmlParam("command", "pwd", true)))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok || len(resp.ToolCalls) != 2 {
+		t.Fatalf("expected 2 recovered calls, got %d (ok=%v)", len(resp.ToolCalls), ok)
+	}
+	if resp.ToolCalls[0].ID == resp.ToolCalls[1].ID {
+		t.Fatalf("tool call IDs must be unique, both are %q", resp.ToolCalls[0].ID)
 	}
 }
