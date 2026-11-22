@@ -2,13 +2,13 @@
 # Heavy variant of the PicoClaw fork image (racso2609/picoclaw)
 # ============================================================
 # Why this image exists:
-# `racso2609/picoclaw:61f45c54` is a deliberately minimal RUNTIME image: it
+# `racso2609/picoclaw:<sha>-slim` is a deliberately minimal RUNTIME image: it
 # only carries what the gateway needs to execute (git, gh, ssh, bash). Project
 # agents, however, are expected to work on real repositories from inside the
 # container: clone, edit, compile, run tests, format, call APIs. For that they
 # need a working toolchain. Adding it to the base image would bloat every
 # deployment, so this file EXTENDS the published base image instead
-# (`FROM racso2609/picoclaw:61f45c54`) and only adds the working tools.
+# (`FROM ${BASE_IMAGE}`) and only adds the working tools.
 #
 # It also fixes the agent's writable scratch space:
 # * TMPDIR was EMPTY in the base image, so `mktemp`, `go build` and
@@ -30,9 +30,11 @@
 # Everything else (nodejs, npm, python3, make, curl, jq, yq) comes from the
 # Alpine repositories, which are new enough for day-to-day work.
 #
-# Build from the repo root:
+# Build from the repo root, passing the tag of the slim image built from the
+# same commit (see docker/Dockerfile.racso):
 # docker build -f docker/Dockerfile.racso-heavy \
-# -t racso2609/picoclaw:61f45c54-heavy .
+# --build-arg BASE_IMAGE=racso2609/picoclaw:<sha>-slim \
+# -t racso2609/picoclaw:<sha>-heavy .
 #
 # Only use this image where the agent actually has to build things;
 # production deployments keep the slim base image.
@@ -48,7 +50,12 @@ FROM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec702
 # ============================================================
 # Stage 2: the published minimal runtime image + working toolchain
 # ============================================================
-FROM racso2609/picoclaw:61f45c54
+# The base tag is a build-arg so the heavy image always extends the slim image
+# built from the SAME commit. It used to be hardcoded to a fixed tag, which
+# silently shipped the old binary inside the "new" heavy image: the heavy
+# Dockerfile only adds tools, so the gateway binary comes entirely from here.
+ARG BASE_IMAGE=racso2609/picoclaw:61f45c54
+FROM ${BASE_IMAGE}
 
 # The base image ends with `USER 1000:1000`; installing packages needs root.
 USER root
