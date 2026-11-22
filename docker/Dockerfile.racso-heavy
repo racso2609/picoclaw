@@ -40,6 +40,16 @@
 # production deployments keep the slim base image.
 # ============================================================
 
+# The base tag is a build-arg so the heavy image always extends the slim image
+# built from the SAME commit. It used to be hardcoded to a fixed tag, which
+# silently shipped the old binary inside the "new" heavy image: this Dockerfile
+# only adds tools, so the gateway binary comes entirely from the base stage.
+#
+# It MUST be declared before the first FROM: an ARG is only visible to the FROM
+# instructions that come after its declaration, so a later FROM would see it as
+# blank ("base name (${BASE_IMAGE}) should not be blank").
+ARG BASE_IMAGE=racso2609/picoclaw:61f45c54
+
 # ============================================================
 # Stage 1: source of a Go toolchain new enough for go.mod
 # ============================================================
@@ -50,11 +60,6 @@ FROM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec702
 # ============================================================
 # Stage 2: the published minimal runtime image + working toolchain
 # ============================================================
-# The base tag is a build-arg so the heavy image always extends the slim image
-# built from the SAME commit. It used to be hardcoded to a fixed tag, which
-# silently shipped the old binary inside the "new" heavy image: the heavy
-# Dockerfile only adds tools, so the gateway binary comes entirely from here.
-ARG BASE_IMAGE=racso2609/picoclaw:61f45c54
 FROM ${BASE_IMAGE}
 
 # The base image ends with `USER 1000:1000`; installing packages needs root.
