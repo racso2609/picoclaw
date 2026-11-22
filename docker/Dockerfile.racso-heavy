@@ -1,0 +1,146 @@
+# ============================================================
+# Heavy variant of the PicoClaw fork image (racso2609/picoclaw)
+# ============================================================
+# Why this image exists:
+# `racso2609/picoclaw:<sha>-slim` is a deliberately minimal RUNTIME image: it
+# only carries what the gateway needs to execute (git, gh, ssh, bash). Project
+# agents, however, are expected to work on real repositories from inside the
+# container: clone, edit, compile, run tests, format, call APIs. For that they
+# need a working toolchain. Adding it to the base image would bloat every
+# deployment, so this file EXTENDS the published base image instead
+# (`FROM ${BASE_IMAGE}`) and only adds the working tools.
+#
+# It also fixes the agent's writable scratch space:
+# * TMPDIR was EMPTY in the base image, so `mktemp`, `go build` and
+#   `git clone` fell back to the shared /tmp;
+# * the workspace AGENT.md rules tell agents to build/download into
+#   `~/tmp/gobuild` and `~/tmp/gcl`. Those directories (and a GOPATH under
+#   $HOME) did not exist.
+# Both are created here owned by uid/gid 1000 and exported as ENV.
+#
+# Why Go comes from the golang image and NOT from `apk add go`:
+# alpine:3.23 ships go-1.25.10-r0, but this fork's go.mod declares
+# `go 1.25.13` and the Makefile exports `GOTOOLCHAIN?=local` (never download a
+# toolchain at build/run time). With the apk package every `go build` aborts
+# with "go.mod requires go >= 1.25.13 (running go 1.25.10)".
+# The golang image carries go1.25.14, which satisfies go.mod, so /usr/local/go
+# is copied verbatim from it. This also keeps the interpreter and GOROOT
+# layout identical to the builder stage of docker/Dockerfile.racso.
+#
+# Everything else (nodejs, npm, python3, make, curl, jq, yq) comes from the
+# Alpine repositories, which are new enough for day-to-day work.
+#
+# Build from the repo root, passing the tag of the slim image built from the
+# same commit (see docker/Dockerfile.racso):
+# docker build -f docker/Dockerfile.racso-heavy \
+# --build-arg BASE_IMAGE=racso2609/picoclaw:<sha>-slim \
+# -t racso2609/picoclaw:<sha>-heavy .
+#
+# Only use this image where the agent actually has to build things;
+# production deployments keep the slim base image.
+# ============================================================
+
+# The base tag is a build-arg so the heavy image always extends the slim image
+# built from the SAME commit. It used to be hardcoded to a fixed tag, which
+# silently shipped the old binary inside the "new" heavy image: this Dockerfile
+# only adds tools, so the gateway binary comes entirely from the base stage.
+#
+# It MUST be declared before the first FROM: an ARG is only visible to the FROM
+# instructions that come after its declaration, so a later FROM would see it as
+# blank ("base name (${BASE_IMAGE}) should not be blank").
+#
+# Deliberately NO default. A default would have to name some tag, and any tag
+# goes stale: the original bug was exactly this (a hardcoded 61f45c54 base that
+# silently shipped the old binary inside a "new" heavy image). Without a
+# default, omitting --build-arg fails fast with
+# "base name (${BASE_IMAGE}) should not be blank" instead of building a
+# plausible-looking image from an obsolete base.
+# bin/build-image.sh always passes it.
+ARG BASE_IMAGE
+
+# ============================================================
+# Stage 1: source of a Go toolchain new enough for go.mod
+# ============================================================
+# Same digest as the builder stage in docker/Dockerfile.racso:
+# golang:1.25-alpine -> go 1.25.14.
+FROM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS gotoolchain
+
+# ============================================================
+# Stage 2: the published minimal runtime image + working toolchain
+# ============================================================
+FROM ${BASE_IMAGE}
+
+# The base image ends with `USER 1000:1000`; installing packages needs root.
+USER root
+
+LABEL org.opencontainers.image.title="picoclaw" \
+org.opencontainers.image.description="PicoClaw AI agent gateway (racso2609 fork) + working toolchain" \
+org.opencontainers.image.source="https://github.com/racso2609/picoclaw"
+
+# ca-certificates/tzdata/git/openssh-client/bash/github-cli are already in the
+# base image but are repeated so this layer is self-describing and stays
+# correct if they are ever dropped upstream.
+# * make: the repo is built with `make build` (build tags + ldflags).
+# * curl: agents call HTTP APIs and download artifacts; the base image only
+#   has busybox wget.
+# * python3 + py3-pip: scripts and MCP-style tooling.
+# * nodejs + npm: web/ frontend work and JS-based skills.
+# * jq + yq: JSON/YAML editing without a scripting detour (yq here is
+#   yq-go, the mikefarah implementation).
+RUN apk add --no-cache \
+ca-certificates \
+tzdata \
+git \
+openssh-client \
+bash \
+github-cli \
+make \
+curl \
+jq \
+yq \
+python3 \
+py3-pip \
+nodejs \
+npm
+
+# Go toolchain (go1.25.14) from stage 1. /usr/local/go/bin is the standard
+# Alpine location, so nothing else can overwrite it.
+COPY --from=gotoolchain /usr/local/go /usr/local/go
+
+# Alpine marks the system Python as externally managed (PEP 668), so a plain
+# `pip install <pkg>` fails with "externally-managed-environment". Agents are
+# expected to install ad-hoc packages inside the container, so opt out
+# globally instead of forcing every caller to remember
+# --break-system-packages.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# Writable scratch space for the agent, owned by uid/gid 1000.
+# ~/tmp/gobuild: build cache + build scratch (see the AGENT.md rules)
+# ~/tmp/gcl:     scratch for `git clone` of repos the agent inspects
+# ~/go:          GOPATH (bin/, pkg/mod) inside the user's home, so the module
+#                cache is user-writable and survives with HOME.
+RUN install -d -o 1000 -g 1000 -m 0755 \
+/home/picoclaw/tmp \
+/home/picoclaw/tmp/gobuild \
+/home/picoclaw/tmp/gcl \
+/home/picoclaw/go
+
+# TMPDIR: the base image left it empty; pointing it at the agent's own home
+# keeps temporary files writable for uid 1000 and out of the shared /tmp.
+# GOMAXPROCS is capped like the builder stage: the host has 4 cores shared
+# with other services.
+ENV TMPDIR=/home/picoclaw/tmp \
+GOPATH=/home/picoclaw/go \
+GOMODCACHE=/home/picoclaw/go/pkg/mod \
+GOCACHE=/home/picoclaw/tmp/gobuild/gocache \
+GOBIN=/home/picoclaw/go/bin \
+GOMAXPROCS=3 \
+PATH=/usr/local/go/bin:/home/picoclaw/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# HEALTHCHECK and ENTRYPOINT are inherited from the base image and are
+# deliberately NOT redeclared here.
+
+# Back to the unprivileged user and workdir, exactly like the base image.
+USER 1000:1000
+
+WORKDIR /home/picoclaw

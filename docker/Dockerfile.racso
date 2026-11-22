@@ -1,0 +1,115 @@
+# ============================================================
+# Custom image for the PicoClaw fork racso2609/picoclaw
+# ============================================================
+# Why `make build` instead of a raw `go build`:
+# * the Makefile applies the build tags `goolm,stdjson` by default
+#   (GO_BUILD_TAGS?=goolm,stdjson) — a plain `go build` would produce a
+#   binary without the pure-Go Matrix (goolm) and std JSON codecs;
+# * the Makefile injects the version ldflags (-X ...Version, GitCommit,
+#   BuildTime, GoVersion, -s -w) so `picoclaw --version` reports the real
+#   build, and `build: generate` runs the workspace embedding step.
+# VERSION and GIT_COMMIT are passed as build-args so the image version is
+# deterministic: the working tree has uncommitted files, and without them
+# `git describe --dirty` would stamp a "-dirty" suffix into the binary.
+#
+# Build from the repo root (the build context must be the repo root because
+# the workspace/ directory is embedded via //go:embed):
+# docker build -f docker/Dockerfile.racso \
+# --build-arg VERSION=nightly-62-g61f45c54 --build-arg GIT_COMMIT=61f45c54 \
+# --build-arg BUILD_TIME=2026-11-13T19:00:00+0000 \
+# -t racso2609/picoclaw:61f45c54 .
+# ============================================================
+
+# ============================================================
+# Stage 1: Build the picoclaw binary
+# ============================================================
+# Pinned by digest for reproducible builds.
+# golang:1.25-alpine -> go 1.25.14-alpine3.24
+FROM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS builder
+
+RUN apk add --no-cache git make
+
+WORKDIR /src
+
+# The host has 4 cores and runs other services: cap the compiler parallelism.
+ARG GOMAXPROCS=3
+ENV GOMAXPROCS=${GOMAXPROCS}
+
+# The Makefile does `GOCACHE?=$(CURDIR)/.cache/go-build` and
+# `GOMODCACHE?=$(CURDIR)/.cache/go-mod` and then `export`s both. Because it
+# uses `?=`, defining them here (before `go mod download`) makes the Makefile
+# keep these values instead of redirecting the module cache into the build
+# context. Without this, `go mod download` below fills /go/pkg/mod and
+# `make build` then re-downloads everything into /src/.cache/go-mod.
+ENV GOMODCACHE=/go/pkg/mod \
+GOCACHE=/root/.cache/go-build
+
+# Cache dependencies as a separate layer
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source (repo root is the build context) and build
+COPY . .
+
+# BUILD_TIME is an ARG (not `date` inside the build) so the binary is
+# reproducible: the caller controls the timestamp, or it stays "unknown".
+ARG VERSION=dev
+ARG GIT_COMMIT=dev
+ARG BUILD_TIME=unknown
+
+# Fail fast instead of silently stamping "dev" into the binary.
+RUN test "${VERSION}" != "dev" \
+|| { echo "ERROR: pass --build-arg VERSION=<git describe output>" >&2; exit 1; }
+RUN test "${GIT_COMMIT}" != "dev" \
+|| { echo "ERROR: pass --build-arg GIT_COMMIT=<short sha>" >&2; exit 1; }
+
+RUN make build VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT} BUILD_TIME=${BUILD_TIME}
+
+# ============================================================
+# Stage 2: Minimal runtime image, non-root
+# ============================================================
+# Pinned by digest for reproducible builds.
+# alpine:3.23 -> 3.23.8
+FROM alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
+
+# Re-declared here: ARGs are per-stage, and the label below needs it.
+ARG VERSION=dev
+
+LABEL org.opencontainers.image.title="picoclaw" \
+org.opencontainers.image.description="PicoClaw AI agent gateway (racso2609 fork)" \
+org.opencontainers.image.source="https://github.com/racso2609/picoclaw" \
+org.opencontainers.image.version="${VERSION}"
+
+# ca-certificates + tzdata for TLS and timezones.
+# git + openssh-client: agents clone/manage repositories, including over SSH
+# (git@github.com:...), which needs ssh, not just git.
+# bash: several bundled skills use `#!/usr/bin/env bash`.
+# github-cli: `gh` for PR/issue workflows from inside the agent.
+# `wget` for the healthcheck comes from busybox, so no curl is needed.
+RUN apk add --no-cache ca-certificates tzdata git openssh-client bash github-cli
+
+# Neutral git identity so agent-made commits do not fail on a missing
+# user.name/user.email. System-wide, so it applies to uid 1000.
+RUN git config --system user.name "PicoClaw Agent" \
+&& git config --system user.email "agent@localhost"
+
+# uid/gid 1000 deliberately matches the `racsolab` host user (uid/gid 1000)
+# so bind-mounted config/workspace directories stay writable.
+RUN addgroup -g 1000 picoclaw \
+&& adduser -u 1000 -G picoclaw -D -s /sbin/nologin -h /home/picoclaw picoclaw
+
+# build/picoclaw is a symlink made by the Makefile to build/picoclaw-linux-amd64
+COPY --from=builder /src/build/picoclaw /usr/local/bin/picoclaw
+
+COPY --chmod=0755 docker/entrypoint.racso.sh /entrypoint.sh
+
+ENV PICOCLAW_HOME=/home/picoclaw
+
+WORKDIR /home/picoclaw
+
+USER 1000:1000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+CMD wget -q --spider http://127.0.0.1:18790/health || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]

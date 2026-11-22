@@ -2196,3 +2196,146 @@ func TestSerializeMessages_StripsSystemParts(t *testing.T) {
 		t.Fatal("system_parts should not appear in serialized output")
 	}
 }
+
+// DSML markup emitted as plain content (no native tool_calls) must be recovered
+// into structured tool calls and stripped from the visible content.
+func TestProviderChat_RecoversDSMLToolCallsFromContent(t *testing.T) {
+	fw := "\uFF5C"
+	markup := "<" + fw + fw + "DSML" + fw + fw + "tool_calls>\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "parameter name=\"action\" string=\"true\">run</" + fw + fw + "DSML" + fw + fw + "parameter>\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "parameter name=\"command\" string=\"true\">ls -la</" + fw + fw + "DSML" + fw + fw + "parameter>\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "invoke>\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "tool_calls>"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]any{
+						"content": "Voy a mirar.\n\n" + markup,
+					},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	out, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deepseek-v4", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(out.ToolCalls))
+	}
+	if out.ToolCalls[0].Name != "exec" {
+		t.Fatalf("Name = %q, want exec", out.ToolCalls[0].Name)
+	}
+	if out.ToolCalls[0].Arguments["action"] != "run" {
+		t.Fatalf("action = %v, want run", out.ToolCalls[0].Arguments["action"])
+	}
+	if out.ToolCalls[0].Arguments["command"] != "ls -la" {
+		t.Fatalf("command = %v, want ls -la", out.ToolCalls[0].Arguments["command"])
+	}
+	if strings.Contains(out.Content, "DSML") {
+		t.Fatalf("markup leaked into content: %q", out.Content)
+	}
+	if out.Content != "Voy a mirar." {
+		t.Fatalf("content = %q", out.Content)
+	}
+	if out.FinishReason != "tool_calls" {
+		t.Fatalf("FinishReason = %q, want tool_calls", out.FinishReason)
+	}
+}
+
+// A model that merely *talks about* the markup inside a code fence must not
+// trigger execution.
+func TestProviderChat_DoesNotExecuteDSMLInsideCodeFence(t *testing.T) {
+	fw := "\uFF5C"
+	markup := "<" + fw + fw + "DSML" + fw + fw + "tool_calls>\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "parameter name=\"action\" string=\"true\">run</" + fw + fw + "DSML" + fw + fw + "parameter>\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "invoke>\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "tool_calls>"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]any{
+						"content": "El formato es:\n\n```\n" + markup + "\n```\n",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	out, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deepseek-v4", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if len(out.ToolCalls) != 0 {
+		t.Fatalf("len(ToolCalls) = %d, want 0", len(out.ToolCalls))
+	}
+	if !strings.Contains(out.Content, "```") {
+		t.Fatalf("content must keep the fenced example: %q", out.Content)
+	}
+}
+
+// Streaming path: DSML arriving as text deltas must be recovered too.
+func TestProviderChatStream_RecoversDSMLToolCallsFromContent(t *testing.T) {
+	fw := "\uFF5C"
+	markup := "<" + fw + fw + "DSML" + fw + fw + "tool_calls>\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "parameter name=\"action\" string=\"true\">run</" + fw + fw + "DSML" + fw + fw + "parameter>\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "parameter name=\"command\" string=\"true\">pwd</" + fw + fw + "DSML" + fw + fw + "parameter>\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "invoke>\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "tool_calls>"
+
+	// Split the markup across several SSE deltas, as a real stream would.
+	half := len(markup) / 2
+	parts := []string{"Mirando.\n\n" + markup[:half], markup[half:]}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, part := range parts {
+			payload, err := json.Marshal(map[string]any{
+				"choices": []map[string]any{{"delta": map[string]any{"content": part}}},
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			_, _ = w.Write([]byte("data: " + string(payload) + "\n\n"))
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	out, err := p.ChatStream(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deepseek-v4", nil, nil)
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(out.ToolCalls))
+	}
+	if out.ToolCalls[0].Name != "exec" || out.ToolCalls[0].Arguments["command"] != "pwd" {
+		t.Fatalf("unexpected tool call: %+v", out.ToolCalls[0])
+	}
+	if strings.Contains(out.Content, "DSML") {
+		t.Fatalf("markup leaked into streamed content: %q", out.Content)
+	}
+	if out.Content != "Mirando." {
+		t.Fatalf("content = %q, want %q", out.Content, "Mirando.")
+	}
+}

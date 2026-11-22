@@ -222,6 +222,7 @@ type turnState struct {
 	gracefulInterrupt     bool
 	gracefulInterruptHint string
 	gracefulTerminalUsed  bool
+	budgetStopRequested   bool
 	hardAbort             bool
 	providerCancel        context.CancelFunc
 	turnCancel            context.CancelFunc
@@ -610,6 +611,18 @@ func (ts *turnState) markGracefulTerminalUsed() {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	ts.gracefulTerminalUsed = true
+}
+
+// markBudgetStopRequested records that the wall-clock turn budget has already
+// triggered a graceful stop, so it is only requested once per turn.
+func (ts *turnState) markBudgetStopRequested() bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.budgetStopRequested {
+		return false
+	}
+	ts.budgetStopRequested = true
+	return true
 }
 
 func (ts *turnState) requestHardAbort() bool {
