@@ -97,4 +97,14 @@ fi
 
 # 6. exec is mandatory: it replaces the shell so SIGTERM from `docker stop`
 # reaches the gateway directly and shutdown is clean.
-exec picoclaw gateway --allow-empty "$@"
+#
+# --allow-empty is NOT passed by default. With it, a config that has no usable
+# default model (or a model_name typo) still starts in "limited mode": /health
+# answers 200 {"status":"ok"} and the container reports healthy while the agent
+# cannot answer anything. Without it the gateway fails and the restart policy
+# surfaces the misconfiguration instead of hiding it. Set
+# PICOCLAW_ALLOW_EMPTY=1 to opt back into the old behaviour.
+if [ "${PICOCLAW_ALLOW_EMPTY:-0}" = "1" ]; then
+  exec picoclaw gateway --allow-empty "$@"
+fi
+exec picoclaw gateway "$@"

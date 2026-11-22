@@ -48,7 +48,15 @@
 # It MUST be declared before the first FROM: an ARG is only visible to the FROM
 # instructions that come after its declaration, so a later FROM would see it as
 # blank ("base name (${BASE_IMAGE}) should not be blank").
-ARG BASE_IMAGE=racso2609/picoclaw:61f45c54
+#
+# Deliberately NO default. A default would have to name some tag, and any tag
+# goes stale: the original bug was exactly this (a hardcoded 61f45c54 base that
+# silently shipped the old binary inside a "new" heavy image). Without a
+# default, omitting --build-arg fails fast with
+# "base name (${BASE_IMAGE}) should not be blank" instead of building a
+# plausible-looking image from an obsolete base.
+# bin/build-image.sh always passes it.
+ARG BASE_IMAGE
 
 # ============================================================
 # Stage 1: source of a Go toolchain new enough for go.mod

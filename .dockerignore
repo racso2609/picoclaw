@@ -1,5 +1,9 @@
-# Do NOT exclude LICENSE or .github — scripts/copydir.go uses them as repo-root anchors
-# during `go generate`, which runs inside `make build` in the Dockerfile.
+# Do NOT exclude LICENSE or .github — scripts/copydir.go uses them as repo-root
+# anchors when it copies the workspace into a project. NOTE: copydir.go is a
+# standalone helper (`go run scripts/copydir.go <src> <dst>`); there is no
+# //go:generate directive in the tree, so it does NOT run as part of
+# `make build`. The exclusion is kept only so a manual copydir invocation from
+# this context still works.
 # Do NOT exclude workspace/ — it is embedded via //go:embed.
 .git
 .gitignore
@@ -18,4 +22,14 @@ assets/
 .cache/
 .artifacts/
 node_modules/
+**/node_modules/
+**/.pnpm-store/
 *.bak*
+# Gitignored secrets must not travel into the build context: the builder stage
+# does `COPY . .`, so they would land in a layer cache even though the final
+# image only copies the binary.
+config.json
+.security.yml
+*.key
+*.pem
+id_*
