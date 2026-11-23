@@ -662,6 +662,43 @@ func TestRecoverDSMLToolCalls_UnclosedInvokeDoesNotSwallowLaterProse(t *testing.
 	}
 }
 
+// TestRecoverDSMLToolCalls_UnclosedOpenerBetweenClosedSiblings covers a bare run
+// where an unterminated opener sits between two well-formed invokes. Invoke
+// elements are siblings, so the closed ones must both be recovered and the
+// orphan must not borrow the arguments of the invoke that follows it.
+func TestRecoverDSMLToolCalls_UnclosedOpenerBetweenClosedSiblings(t *testing.T) {
+	opener := func(n string) string {
+		return "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"" + n + "\">"
+	}
+	content := opener("first") + "\n" + dsmlParam("command", "echo uno", true) + "\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "invoke>\n" +
+		opener("orphan") + "\nno lo cierro\n" +
+		opener("second") + "\n" + dsmlParam("command", "echo dos", true) + "\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "invoke>"
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("the two closed invokes must be recovered")
+	}
+	if len(resp.ToolCalls) != 2 {
+		t.Fatalf("len(ToolCalls) = %d, want 2", len(resp.ToolCalls))
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo uno" {
+		t.Fatalf("first command = %v, want 'echo uno'", got)
+	}
+	if got := resp.ToolCalls[1].Arguments["command"]; got != "echo dos" {
+		t.Fatalf("second command = %v, want 'echo dos'", got)
+	}
+	for _, c := range resp.ToolCalls {
+		if c.Name == "orphan" {
+			t.Fatalf("the unterminated opener must not be executed, got %v", c.Arguments)
+		}
+	}
+	if !strings.Contains(resp.Content, "no lo cierro") {
+		t.Fatalf("prose after the orphan must survive, got %q", resp.Content)
+	}
+}
+
 // TestRecoverDSMLToolCalls_ParameterMentionsOpener covers a valid block whose
 // parameter value quotes an opener literally (the model documenting its own
 // syntax). The block must still be recovered: a close belongs to the opener it
