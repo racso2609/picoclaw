@@ -249,23 +249,26 @@ func findBareDSMLInvocations(content, masked string) []dsmlBlock {
 type dsmlInvokeSpan struct{ start, end int }
 
 // scanDSMLInvocations walks s once and returns the invoke elements that are
-// well-formed, in document order.
+// safe to execute, in document order.
 //
-// Invoke elements are siblings, not nested, and a model that emits DSML as text
-// can leave any of them unterminated. Two rules keep that from turning into
-// executing the wrong tool:
+// Invoke elements are siblings, but a model that emits DSML as text can leave
+// any of them unterminated. The rules below exist so that malformed output
+// degrades to "nothing runs" instead of "the wrong thing runs":
 //
-//   - An unterminated element is never returned. Its opener stays visible in
-//     the content, so nothing is executed on its behalf.
-//   - A parameter that never closes invalidates the invoke that contains it: a
-//     body whose parameters do not line up cannot be attributed to the right
-//     tool, so it is not executed either.
+//   - An element that never closes is never returned. Its opener stays visible
+//     in the content.
+//   - A structural tag inside a parameter value means the parameter never
+//     closed: a value is text, and markup in it cannot be told apart from real
+//     markup. The invoke is not executed.
+//   - Anything opened while an abandoned element is still on the stack inherits
+//     that: its markup came from inside a value that never closed, so it is not
+//     executed either, however well-formed it looks.
 //
-// A parameter's value is user-visible text and may quote markup, so an
-// <invoke> opener found inside one is treated as text when the value closes
-// right after it (the value is quoting a complete tag) and as a sibling opener
-// otherwise. That lookahead is bounded by the next structural tag, which the
-// walk then consumes, so the whole scan stays linear.
+// The third rule is what makes a value that quotes a complete call safe. A
+// value like `usa <invoke name="exec">…</invoke> y listo` is indistinguishable
+// from a real nested call, so treating it as text would mean executing whatever
+// it quotes. The cost is that a model documenting its own syntax loses that one
+// call; the block stays as text.
 func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 	const (
 		frameInvoke = iota
@@ -274,21 +277,21 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 	type frame struct {
 		kind      int
 		start     int
-		abandoned int
+		abandoned bool
+		untrusted bool
 	}
 
 	var stack []frame
 	var spans []dsmlInvokeSpan
 
+	// abandonParameters drops the pending parameter frames and marks the invoke
+	// that contained them as abandoned.
 	abandonParameters := func() {
 		for len(stack) > 0 && stack[len(stack)-1].kind == frameParameter {
 			stack = stack[:len(stack)-1]
-			for i := len(stack) - 1; i >= 0; i-- {
-				if stack[i].kind == frameInvoke {
-					stack[i].abandoned++
-					break
-				}
-			}
+		}
+		if n := len(stack); n > 0 && stack[n-1].kind == frameInvoke {
+			stack[n-1].abandoned = true
 		}
 	}
 
@@ -309,30 +312,36 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 		switch {
 		case !isClose && (name == "invoke" || name == "parameter"):
 			if top == frameParameter {
-				// Inside a parameter value. Quoting a complete tag is text: the
-				// value closes right after it, so resume at that close. A real
-				// sibling opener means the parameter never closed.
-				if quotesCompleteTag(s, tagEnd, name) {
-					i = skipQuotedTag(s, tagEnd, name)
-					continue
-				}
 				abandonParameters()
 			}
 			kind := frameInvoke
 			if name == "parameter" {
 				kind = frameParameter
 			}
-			stack = append(stack, frame{kind: kind, start: i})
+			// O(1): the parent already carries the taint, so it does not have
+			// to be recomputed by walking the stack.
+			untrusted := false
+			if len(stack) > 0 {
+				p := stack[len(stack)-1]
+				untrusted = p.abandoned || p.untrusted
+			}
+			stack = append(stack, frame{kind: kind, start: i, untrusted: untrusted})
 		case isClose && name == "parameter":
 			if top == frameParameter {
 				stack = stack[:len(stack)-1]
 			}
 		case isClose && name == "invoke":
-			abandonParameters()
+			// Drop any parameter still open inside this invoke: the parameter
+			// never closed, so the invoke's body cannot be attributed.
+			unterminated := false
+			for len(stack) > 0 && stack[len(stack)-1].kind == frameParameter {
+				stack = stack[:len(stack)-1]
+				unterminated = true
+			}
 			if n := len(stack); n > 0 && stack[n-1].kind == frameInvoke {
 				f := stack[n-1]
 				stack = stack[:n-1]
-				if f.abandoned == 0 {
+				if !f.abandoned && !f.untrusted && !unterminated {
 					spans = append(spans, dsmlInvokeSpan{start: f.start, end: tagEnd})
 				}
 			}
@@ -340,67 +349,6 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 		i = tagEnd
 	}
 	return spans
-}
-
-// quotesCompleteTag reports whether the opener ending at from is being quoted
-// as text inside a parameter value: the element it opens closes again before
-// any sibling element starts. That is how a value like
-//
-//	usa <parameter name="name">x</parameter> y listo
-//
-// is told apart from a real sibling opener, which never closes before the next
-// element begins.
-func quotesCompleteTag(s string, from int, name string) bool {
-	for i := from; i < len(s); {
-		if s[i] != '<' {
-			i++
-			continue
-		}
-		n, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
-		if !parsed {
-			i++
-			continue
-		}
-		if isClose && n == name {
-			return true
-		}
-		if !isClose && (n == "invoke" || n == "parameter") {
-			return false
-		}
-		// An invoke opener quoted in a value is never closed by the value: the
-		// value closes right after it, so a </parameter> is enough evidence.
-		if isClose && n == "parameter" && name == "invoke" {
-			return true
-		}
-		i = tagEnd
-	}
-	return false
-}
-
-// skipQuotedTag returns the offset to resume the walk from after a quoted tag
-// opened at from. A quoted <parameter> closes itself, so the walk resumes past
-// its close. A quoted <invoke> does not: the first close belongs to the value,
-// so the walk must stop right before it and let the caller consume it.
-func skipQuotedTag(s string, from int, name string) int {
-	for i := from; i < len(s); {
-		if s[i] != '<' {
-			i++
-			continue
-		}
-		n, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
-		if !parsed {
-			i++
-			continue
-		}
-		if isClose {
-			if name == "invoke" && n == "parameter" {
-				return i
-			}
-			return tagEnd
-		}
-		i = tagEnd
-	}
-	return len(s)
 }
 
 // parseDSMLTagAt parses a DSML opening or closing tag starting at s[start] ==
@@ -616,10 +564,10 @@ func parseDSMLInvocations(body string) []protocoltypes.ToolCall {
 // parseDSMLParameters extracts the top-level parameter elements of an invoke
 // body.
 //
-// It walks the body with the same rules as the invoke scanner, so a value that
-// quotes a complete <parameter> tag is read as text instead of being taken for
-// a nested element (which would leave the real parameter unterminated and cut
-// the value short).
+// The body comes from a matched invoke, so every parameter in it closed before
+// any structural opener appeared: the first </parameter> after an opener is its
+// own. The value ends exactly there, which is why the close offset is used
+// instead of searching for the last "</" (a value may contain one).
 func parseDSMLParameters(inner string) map[string]any {
 	args := map[string]any{}
 	for i := 0; i < len(inner); {
@@ -634,12 +582,10 @@ func parseDSMLParameters(inner string) map[string]any {
 		}
 		closeStart, end, closed := scanParameterBody(inner, tagEnd)
 		if !closed {
-			// Unterminated parameter: nothing after it can be attributed.
 			break
 		}
-		attrs := inner[i:tagEnd]
-		paramName := dsmlAttr(attrs, "name")
-		isString := strings.EqualFold(dsmlAttr(attrs, "string"), "true")
+		paramName := dsmlAttr(inner[i:tagEnd], "name")
+		isString := strings.EqualFold(dsmlAttr(inner[i:tagEnd], "string"), "true")
 		if paramName != "" {
 			args[paramName] = dsmlParamValue(inner[tagEnd:closeStart], isString)
 		}
@@ -651,9 +597,9 @@ func parseDSMLParameters(inner string) map[string]any {
 	return args
 }
 
-// scanParameterBody returns the offset just past the </parameter> matching the
-// opener whose tag ends at from. A quoted complete <parameter>...</parameter>
-// inside the value is text when the value closes right after it.
+// scanParameterBody returns the value's close offset and the offset just past
+// the closing tag. The body comes from a matched invoke, so no structural tag
+// can appear inside a value; one that does means the parameter never closed.
 func scanParameterBody(s string, from int) (closeStart int, end int, ok bool) {
 	for i := from; i < len(s); {
 		if s[i] != '<' {
@@ -669,11 +615,6 @@ func scanParameterBody(s string, from int) (closeStart int, end int, ok bool) {
 		case isClose && name == "parameter":
 			return i, tagEnd, true
 		case !isClose && (name == "parameter" || name == "invoke"):
-			// Quoting a complete tag is text when the value closes right after.
-			if quotesCompleteTag(s, tagEnd, name) {
-				i = skipQuotedTag(s, tagEnd, name)
-				continue
-			}
 			return 0, 0, false
 		}
 		i = tagEnd

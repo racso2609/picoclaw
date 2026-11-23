@@ -663,31 +663,24 @@ func TestRecoverDSMLToolCalls_UnclosedInvokeDoesNotSwallowLaterProse(t *testing.
 	}
 }
 
-// TestRecoverDSMLToolCalls_BareParameterMentionsOpener covers the same case as
-// ParameterMentionsOpener but without a wrapper: the bare path must skip a
-// parameter's value before looking for structural tags, or the quoted opener is
-// taken for a sibling and the block is dropped.
+// TestRecoverDSMLToolCalls_BareParameterMentionsOpener is the bare variant of
+// ParameterMentionsOpener: same rule, same outcome.
 func TestRecoverDSMLToolCalls_BareParameterMentionsOpener(t *testing.T) {
 	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
 	content := dsmlInvoke("exec", dsmlParam("command", "echo '"+opener+" es la sintaxis'", true))
 
-	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
-	if !ok {
-		t.Fatal("a bare invoke quoting an opener in a parameter must be recovered")
+	resp, _ := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if len(resp.ToolCalls) != 0 {
+		t.Fatalf("len(ToolCalls) = %d, want 0: a value quoting an opener must not execute", len(resp.ToolCalls))
 	}
-	if len(resp.ToolCalls) != 1 {
-		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
-	}
-	got, _ := resp.ToolCalls[0].Arguments["command"].(string)
-	if !strings.Contains(got, "es la sintaxis") {
-		t.Fatalf("command = %q, want it to keep the quoted opener", got)
+	if !strings.Contains(resp.Content, "es la sintaxis") {
+		t.Fatalf("the quoted text must survive, got %q", resp.Content)
 	}
 }
 
 // TestRecoverDSMLToolCalls_ParameterValueQuotesParameter covers a value that
-// quotes a complete <parameter> tag. Taking the quoted opener for a real one
-// leaves the outer parameter unterminated, so the whole invoke is dropped and a
-// valid call is lost.
+// quotes a complete <parameter> tag. It is markup inside a value, so the invoke
+// is not executed: quoting a call must never run it.
 func TestRecoverDSMLToolCalls_ParameterValueQuotesParameter(t *testing.T) {
 	inner := "<" + fw + fw + "DSML" + fw + fw + "parameter name=\"name\" string=\"true\">x</" +
 		fw + fw + "DSML" + fw + fw + "parameter>"
@@ -703,28 +696,45 @@ func TestRecoverDSMLToolCalls_ParameterValueQuotesParameter(t *testing.T) {
 		{"wrapper", dsmlCanonical(content)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: tc.content})
-			if !ok {
-				t.Fatal("a value quoting a complete parameter must not lose the call")
+			resp, _ := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: tc.content})
+			if len(resp.ToolCalls) != 0 {
+				t.Fatalf("len(ToolCalls) = %d, want 0: a value quoting a parameter must not execute", len(resp.ToolCalls))
 			}
-			if len(resp.ToolCalls) != 1 {
-				t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
-			}
-			if got := resp.ToolCalls[0].Arguments["command"]; got != value {
-				t.Fatalf("command = %q, want the whole quoted value", got)
-			}
-			if got := resp.ToolCalls[0].Arguments["dir"]; got != "/tmp" {
-				t.Fatalf("dir = %v, want /tmp (the parameters after the quoted one must survive)", got)
+			if !strings.Contains(resp.Content, "y listo") {
+				t.Fatalf("the quoted text must survive, got %q", resp.Content)
 			}
 		})
 	}
 }
 
+// TestRecoverDSMLToolCalls_QuotedCallIsNotExecuted covers a value that quotes a
+// complete call. This is the case that decides the design: a quoted call is
+// byte-identical to a real nested one, so the only safe reading is "not
+// executable". Executing it would run whatever the value happens to quote.
+func TestRecoverDSMLToolCalls_QuotedCallIsNotExecuted(t *testing.T) {
+	quoted := dsmlInvoke("exec", dsmlParam("command", "rm -rf /", true))
+	content := dsmlInvoke("read", dsmlParam("q", "usa "+quoted+" y listo", true))
+
+	resp, _ := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	for _, c := range resp.ToolCalls {
+		if c.Name == "exec" {
+			t.Fatalf("a quoted call must never be executed, got %v", c.Arguments)
+		}
+	}
+	if len(resp.ToolCalls) != 0 {
+		t.Fatalf("len(ToolCalls) = %d, want 0", len(resp.ToolCalls))
+	}
+}
+
 // TestRecoverDSMLToolCalls_UnclosedParameterDoesNotStealSibling covers an
 // unterminated opener whose <parameter> never closes, followed by a well-formed
-// sibling. Skipping a parameter by searching for its close tag would land on the
-// sibling's </parameter>, then take the sibling's </invoke>: the orphan would run
-// with the sibling's arguments.
+// sibling.
+//
+// Nothing runs. The orphan must not run with the sibling's arguments, and the
+// sibling itself is not recoverable either: after an unterminated parameter the
+// markup that follows is byte-identical to a value quoting a complete call, and
+// executing that would run whatever a value happens to quote. Losing one call
+// is the price of never running an unopened one.
 func TestRecoverDSMLToolCalls_UnclosedParameterDoesNotStealSibling(t *testing.T) {
 	opener := func(n string) string {
 		return "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"" + n + "\">"
@@ -735,18 +745,17 @@ func TestRecoverDSMLToolCalls_UnclosedParameterDoesNotStealSibling(t *testing.T)
 	content := opener("orphan") + "\n" + param("x") + "sin cerrar\n" +
 		dsmlInvoke("real", dsmlParam("command", "echo real", true))
 
-	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
-	if !ok {
-		t.Fatal("the well-formed sibling must be recovered")
+	resp, _ := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	for _, c := range resp.ToolCalls {
+		if c.Name == "orphan" {
+			t.Fatalf("the orphan must not run, got %v", c.Arguments)
+		}
 	}
-	if len(resp.ToolCalls) != 1 {
-		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	if len(resp.ToolCalls) != 0 {
+		t.Fatalf("len(ToolCalls) = %d, want 0 (ambiguous markup must not execute)", len(resp.ToolCalls))
 	}
-	if resp.ToolCalls[0].Name != "real" {
-		t.Fatalf("name = %q, want 'real' (the orphan must not run)", resp.ToolCalls[0].Name)
-	}
-	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo real" {
-		t.Fatalf("command = %v, want 'echo real'", got)
+	if !strings.Contains(resp.Content, "sin cerrar") {
+		t.Fatalf("the prose must survive, got %q", resp.Content)
 	}
 }
 
@@ -815,25 +824,21 @@ func TestRecoverDSMLToolCalls_UnclosedOpenerBetweenClosedSiblings(t *testing.T) 
 	}
 }
 
-// TestRecoverDSMLToolCalls_ParameterMentionsOpener covers a valid block whose
+// TestRecoverDSMLToolCalls_ParameterMentionsOpener covers a block whose
 // parameter value quotes an opener literally (the model documenting its own
-// syntax). The block must still be recovered: a close belongs to the opener it
-// matches, not to a later one that merely appears in text.
+// syntax). Markup inside a value cannot be told apart from real markup, so the
+// block is left as text rather than executing whatever it quotes.
 func TestRecoverDSMLToolCalls_ParameterMentionsOpener(t *testing.T) {
 	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
 	body := dsmlParam("command", "echo '"+opener+" es la sintaxis'", true)
 	content := dsmlCanonical(dsmlInvoke("exec", body))
 
-	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
-	if !ok {
-		t.Fatal("a valid block must be recovered even if a parameter quotes an opener")
+	resp, _ := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if len(resp.ToolCalls) != 0 {
+		t.Fatalf("len(ToolCalls) = %d, want 0: a value quoting an opener must not execute", len(resp.ToolCalls))
 	}
-	if len(resp.ToolCalls) != 1 {
-		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
-	}
-	got, _ := resp.ToolCalls[0].Arguments["command"].(string)
-	if !strings.Contains(got, "es la sintaxis") {
-		t.Fatalf("command = %q, want it to keep the quoted opener", got)
+	if !strings.Contains(resp.Content, "es la sintaxis") {
+		t.Fatalf("the quoted text must survive, got %q", resp.Content)
 	}
 }
 
