@@ -890,6 +890,58 @@ func TestRecoverDSMLToolCalls_UnclosedOpenersStayLinear(t *testing.T) {
 	}
 }
 
+// TestRecoverDSMLToolCalls_ValidSiblingsAroundOrphan pins what survives an
+// unterminated parameter: invokes that closed before it are still recovered, and
+// the ones after it are not (their markup is indistinguishable from a value
+// quoting a complete call).
+func TestRecoverDSMLToolCalls_ValidSiblingsAroundOrphan(t *testing.T) {
+	opener := func(n string) string {
+		return "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"" + n + "\">"
+	}
+	param := func(n string) string {
+		return "<" + fw + fw + "DSML" + fw + fw + "parameter name=\"" + n + "\" string=\"true\">"
+	}
+	before := dsmlInvoke("first", dsmlParam("command", "echo uno", true))
+	after := dsmlInvoke("third", dsmlParam("command", "echo tres", true))
+	content := before + "\n" +
+		opener("orphan") + "\n" + param("x") + "sin cerrar\n" +
+		after
+
+	resp, _ := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1 (only the invoke closed before the orphan)", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].Name != "first" {
+		t.Fatalf("name = %q, want 'first'", resp.ToolCalls[0].Name)
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo uno" {
+		t.Fatalf("command = %v, want 'echo uno'", got)
+	}
+}
+
+// TestRecoverDSMLToolCalls_DeepNestingInsideAbandonedValueIsNotExecuted pins the
+// taint propagation: once a parameter is abandoned, everything opened inside it
+// is untrusted however deep and however well-formed, because its markup came
+// from inside a value that never closed.
+func TestRecoverDSMLToolCalls_DeepNestingInsideAbandonedValueIsNotExecuted(t *testing.T) {
+	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"x\">"
+	param := "<" + fw + fw + "DSML" + fw + fw + "parameter name=\"p\" string=\"true\">"
+	closer := "</" + fw + fw + "DSML" + fw + fw + "invoke>"
+
+	// An abandoned parameter, then a deep, perfectly well-formed call inside it.
+	deep := strings.Repeat(opener, 8) + dsmlParam("command", "rm -rf /", true) +
+		strings.Repeat(closer, 8)
+	content := opener + param + "sin cerrar\n" + deep
+
+	resp, _ := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if len(resp.ToolCalls) != 0 {
+		t.Fatalf("len(ToolCalls) = %d, want 0: markup inside an abandoned value must not run", len(resp.ToolCalls))
+	}
+	if !strings.Contains(resp.Content, "rm -rf /") {
+		t.Fatalf("the value must survive as text, got %q", resp.Content)
+	}
+}
+
 // TestRecoverDSMLToolCalls_UnclosedParametersStayLinear covers the nastier
 // shape: every opener is followed by a <parameter> that never closes. Skipping
 // a parameter by searching for its close would scan the rest of the content for

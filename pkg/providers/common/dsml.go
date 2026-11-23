@@ -245,8 +245,22 @@ func findBareDSMLInvocations(content, masked string) []dsmlBlock {
 }
 
 // dsmlInvokeSpan is a matched invoke element, from its opener to just past its
-// closing tag.
-type dsmlInvokeSpan struct{ start, end int }
+// closing tag, with the parameters the walk already validated.
+type dsmlInvokeSpan struct {
+	start, end int
+	name       string
+	params     []dsmlParamSpan
+}
+
+// dsmlParamSpan is a parameter the walk validated: its name and the exact range
+// of its value. Reusing these ranges is what keeps the parser from re-scanning
+// the body with rules that could drift from the walk's.
+type dsmlParamSpan struct {
+	name       string
+	isString   bool
+	valueStart int
+	valueEnd   int
+}
 
 // scanDSMLInvocations walks s once and returns the invoke elements that are
 // safe to execute, in document order.
@@ -277,8 +291,10 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 	type frame struct {
 		kind      int
 		start     int
+		tagEnd    int
 		abandoned bool
 		untrusted bool
+		params    []dsmlParamSpan
 	}
 
 	var stack []frame
@@ -325,10 +341,20 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 				p := stack[len(stack)-1]
 				untrusted = p.abandoned || p.untrusted
 			}
-			stack = append(stack, frame{kind: kind, start: i, untrusted: untrusted})
+			stack = append(stack, frame{kind: kind, start: i, tagEnd: tagEnd, untrusted: untrusted})
 		case isClose && name == "parameter":
 			if top == frameParameter {
+				f := stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
+				if n := len(stack); n > 0 && stack[n-1].kind == frameInvoke {
+					attrs := s[f.start:f.tagEnd]
+					stack[n-1].params = append(stack[n-1].params, dsmlParamSpan{
+						name:       dsmlAttr(attrs, "name"),
+						isString:   strings.EqualFold(dsmlAttr(attrs, "string"), "true"),
+						valueStart: f.tagEnd,
+						valueEnd:   i,
+					})
+				}
 			}
 		case isClose && name == "invoke":
 			// Drop any parameter still open inside this invoke: the parameter
@@ -342,7 +368,12 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 				f := stack[n-1]
 				stack = stack[:n-1]
 				if !f.abandoned && !f.untrusted && !unterminated {
-					spans = append(spans, dsmlInvokeSpan{start: f.start, end: tagEnd})
+					spans = append(spans, dsmlInvokeSpan{
+						start:  f.start,
+						end:    tagEnd,
+						name:   dsmlAttr(s[f.start:f.tagEnd], "name"),
+						params: f.params,
+					})
 				}
 			}
 		}
@@ -531,95 +562,37 @@ func findDSMLClose(s string, from int, closeTag string) (int, bool) {
 	return findNextDSMLClose(s, from, strings.TrimPrefix(closeTag, "</"))
 }
 
-// parseDSMLInvocations extracts every well-formed invoke element in body.
+// parseDSMLInvocations extracts every invoke the walk validated, using the
+// parameter ranges it already resolved. Re-scanning the body here would apply a
+// second set of rules, and the two would drift apart.
 func parseDSMLInvocations(body string) []protocoltypes.ToolCall {
 	var calls []protocoltypes.ToolCall
 	for _, sp := range scanDSMLInvocations(body) {
-		_, tagEnd, ok := parseDSMLOpenTag(body, sp.start)
-		if !ok {
+		if sp.name == "" {
 			continue
 		}
-		toolName := dsmlAttr(body[sp.start:tagEnd], "name")
-		if toolName == "" {
-			continue
+		args := map[string]any{}
+		for _, ps := range sp.params {
+			if ps.name == "" {
+				continue
+			}
+			args[ps.name] = dsmlParamValue(body[ps.valueStart:ps.valueEnd], ps.isString)
 		}
-		args := parseDSMLParameters(body[tagEnd:sp.end])
-		if args == nil {
+		if len(args) == 0 {
 			continue
 		}
 		calls = append(calls, protocoltypes.ToolCall{
 			ID:        newDSMLCallID(len(calls)),
 			Type:      "function",
-			Name:      toolName,
+			Name:      sp.name,
 			Arguments: args,
 			Function: &protocoltypes.FunctionCall{
-				Name:      toolName,
+				Name:      sp.name,
 				Arguments: mustJSON(args),
 			},
 		})
 	}
 	return calls
-}
-
-// parseDSMLParameters extracts the top-level parameter elements of an invoke
-// body.
-//
-// The body comes from a matched invoke, so every parameter in it closed before
-// any structural opener appeared: the first </parameter> after an opener is its
-// own. The value ends exactly there, which is why the close offset is used
-// instead of searching for the last "</" (a value may contain one).
-func parseDSMLParameters(inner string) map[string]any {
-	args := map[string]any{}
-	for i := 0; i < len(inner); {
-		if inner[i] != '<' {
-			i++
-			continue
-		}
-		name, isClose, tagEnd, ok := parseDSMLTagAt(inner, i)
-		if !ok || isClose || name != "parameter" {
-			i++
-			continue
-		}
-		closeStart, end, closed := scanParameterBody(inner, tagEnd)
-		if !closed {
-			break
-		}
-		paramName := dsmlAttr(inner[i:tagEnd], "name")
-		isString := strings.EqualFold(dsmlAttr(inner[i:tagEnd], "string"), "true")
-		if paramName != "" {
-			args[paramName] = dsmlParamValue(inner[tagEnd:closeStart], isString)
-		}
-		i = end
-	}
-	if len(args) == 0 {
-		return nil
-	}
-	return args
-}
-
-// scanParameterBody returns the value's close offset and the offset just past
-// the closing tag. The body comes from a matched invoke, so no structural tag
-// can appear inside a value; one that does means the parameter never closed.
-func scanParameterBody(s string, from int) (closeStart int, end int, ok bool) {
-	for i := from; i < len(s); {
-		if s[i] != '<' {
-			i++
-			continue
-		}
-		name, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
-		if !parsed {
-			i++
-			continue
-		}
-		switch {
-		case isClose && name == "parameter":
-			return i, tagEnd, true
-		case !isClose && (name == "parameter" || name == "invoke"):
-			return 0, 0, false
-		}
-		i = tagEnd
-	}
-	return 0, 0, false
 }
 
 // dsmlParamValue decodes a parameter value. Values flagged string="true" are
