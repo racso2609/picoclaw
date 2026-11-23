@@ -819,6 +819,34 @@ func TestRecoverDSMLToolCalls_UnclosedOpenersStayLinear(t *testing.T) {
 	}
 }
 
+// TestRecoverDSMLToolCalls_UnclosedParametersStayLinear covers the nastier
+// shape: every opener is followed by a <parameter> that never closes. Skipping
+// a parameter by searching for its close would scan the rest of the content for
+// each opener (8x the input, 53x the time); the single-pass state machine walks
+// it once.
+func TestRecoverDSMLToolCalls_UnclosedParametersStayLinear(t *testing.T) {
+	unit := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">\n" +
+		"<" + fw + fw + "DSML" + fw + fw + "parameter name=\"x\" string=\"true\">"
+	if testing.Short() {
+		t.Skip("timing test")
+	}
+	measure := func(n int) time.Duration {
+		content := strings.Repeat(unit, n) + "tail"
+		start := time.Now()
+		RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+		return time.Since(start)
+	}
+	measure(250) // warm up
+	small := measure(1000)
+	large := measure(4000)
+	if small < time.Millisecond {
+		small = time.Millisecond
+	}
+	if ratio := float64(large) / float64(small); ratio > 8 {
+		t.Fatalf("4x the input took %.1fx the time (%v -> %v), want linear", ratio, small, large)
+	}
+}
+
 // BenchmarkRecoverDSMLToolCalls_UnclosedOpeners keeps the linearity claim
 // measurable without a wall-clock assertion.
 func BenchmarkRecoverDSMLToolCalls_UnclosedOpeners(b *testing.B) {

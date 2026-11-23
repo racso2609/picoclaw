@@ -280,36 +280,52 @@ func findBareDSMLInvocations(content, masked string) []dsmlBlock {
 }
 
 // findInvokeBodyEnd scans forward from from (just past an invoke opener) and
-// returns the offset just past the matching </invoke>. Parameter elements are
-// skipped wholesale: their values are user-visible text and can contain markup
-// that must not be mistaken for a structural tag.
+// returns the offset just past the matching </invoke>.
 //
-// When another invoke opener is reached first, the element is unterminated:
-// ok is false and next is that sibling's offset, so the caller can resume there
-// without rescanning. When no close is found at all, ok is false and next is 0.
+// The scan is a single pass with one bit of state: whether it is inside a
+// <parameter> element. A parameter's value is user-visible text and may quote
+// markup, so openers inside one are text and are ignored; only </parameter>
+// leaves the element. An </invoke> seen while still inside a parameter means
+// the parameter never closed, and that close is the enclosing invoke's.
+//
+// A sibling <invoke> opener reached outside any parameter means this element
+// was never terminated: ok is false and next is that sibling's offset, so the
+// caller resumes there instead of rescanning. When the scan runs out of input
+// without finding any close, next is len(s): no later opener can be closed
+// either, so the caller stops. Both rules are what keep the pass linear even
+// when every opener is followed by an unterminated parameter.
 func findInvokeBodyEnd(s string, from int) (end int, next int, ok bool) {
-	for i := from; i < len(s); i++ {
+	inParam := false
+	for i := from; i < len(s); {
 		if s[i] != '<' {
+			i++
 			continue
 		}
-		name, isClose, tagEnd, ok := parseDSMLTagAt(s, i)
-		if !ok {
+		name, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
+		if !parsed {
+			i++
 			continue
 		}
 		switch {
-		case !isClose && name == "parameter":
-			closeEnd, found := findNextDSMLClose(s, tagEnd, "parameter")
-			if !found {
-				return 0, 0, false
+		case inParam:
+			switch {
+			case isClose && name == "parameter":
+				inParam = false
+			case isClose && name == "invoke":
+				// The parameter never closed; this close is the invoke's.
+				return tagEnd, 0, true
 			}
-			i = closeEnd - 1
+			// Anything else, including a quoted opener, is parameter text.
+		case !isClose && name == "parameter":
+			inParam = true
 		case isClose && name == "invoke":
 			return tagEnd, 0, true
 		case !isClose && name == "invoke":
 			return 0, i, false
 		}
+		i = tagEnd
 	}
-	return 0, 0, false
+	return 0, len(s), false
 }
 
 // parseDSMLTagAt parses a DSML opening or closing tag starting at s[start] ==
