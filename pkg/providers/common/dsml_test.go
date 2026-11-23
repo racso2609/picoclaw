@@ -28,6 +28,18 @@ func dsmlParam(name, value string, isString bool) string {
 	return "<" + fw + fw + "DSML" + fw + fw + "parameter name=\"" + name + "\"" + attr + ">" + value + "</" + fw + fw + "DSML" + fw + fw + "parameter>"
 }
 
+func dsmlInvokeLiteral(literal, name, params string) string {
+	return "<" + fw + fw + literal + fw + fw + "invoke name=\"" + name + "\">\n" + params + "\n</" + fw + fw + literal + fw + fw + "invoke>"
+}
+
+func dsmlParamLiteral(literal, name, value string, isString bool) string {
+	attr := ""
+	if isString {
+		attr = ` string="true"`
+	}
+	return "<" + fw + fw + literal + fw + fw + "parameter name=\"" + name + "\"" + attr + ">" + value + "</" + fw + fw + literal + fw + fw + "parameter>"
+}
+
 func TestRecoverDSMLToolCalls_CanonicalFullwidth(t *testing.T) {
 	content := "Voy a mirar.\n\n" + dsmlCanonical(
 		dsmlInvoke("exec", dsmlParam("action", "run", true)+"\n"+dsmlParam("command", "ls -la", true)),
@@ -434,17 +446,21 @@ func dsmlWrapperLiteral(literal, name, body string) string {
 
 func TestRecoverDSMLToolCalls_BlockNameVariants(t *testing.T) {
 	body := dsmlInvoke("exec", dsmlParam("command", "ls -la", true))
+	// The lowercase case needs the whole payload lowercase: with a "DSML"
+	// invoke inside, the bare-invoke fallback recovers the call anyway and the
+	// case-insensitivity of the marker could be removed without a failure.
+	lowerBody := dsmlInvokeLiteral("dsml", "exec", dsmlParamLiteral("dsml", "command", "ls -la", true))
 
-	cases := []struct{ name, wrapper, literal string }{
-		{"dropped tool prefix", "calls", "DSML"},
-		{"space separator", "tool calls", "DSML"},
-		{"tokenizer word separator", "tool\u2581calls", "DSML"},
-		{"lowercase marker", "tool_calls", "dsml"},
-		{"function_call singular", "function_call", "DSML"},
+	cases := []struct{ name, wrapper, literal, body string }{
+		{"dropped tool prefix", "calls", "DSML", body},
+		{"space separator", "tool calls", "DSML", body},
+		{"tokenizer word separator", "tool\u2581calls", "DSML", body},
+		{"lowercase marker", "tool_calls", "dsml", lowerBody},
+		{"function_call singular", "function_call", "DSML", body},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			content := dsmlWrapperLiteral(c.literal, c.wrapper, body)
+			content := dsmlWrapperLiteral(c.literal, c.wrapper, c.body)
 			resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
 			if !ok {
 				t.Fatalf("wrapper %q must be recovered", c.wrapper)
