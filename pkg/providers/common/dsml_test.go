@@ -684,6 +684,42 @@ func TestRecoverDSMLToolCalls_BareParameterMentionsOpener(t *testing.T) {
 	}
 }
 
+// TestRecoverDSMLToolCalls_ParameterValueQuotesParameter covers a value that
+// quotes a complete <parameter> tag. Taking the quoted opener for a real one
+// leaves the outer parameter unterminated, so the whole invoke is dropped and a
+// valid call is lost.
+func TestRecoverDSMLToolCalls_ParameterValueQuotesParameter(t *testing.T) {
+	inner := "<" + fw + fw + "DSML" + fw + fw + "parameter name=\"name\" string=\"true\">x</" +
+		fw + fw + "DSML" + fw + fw + "parameter>"
+	value := "usa " + inner + " y listo"
+	content := dsmlInvoke("exec",
+		dsmlParam("command", value, true)+"\n"+dsmlParam("dir", "/tmp", true))
+
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{"bare", content},
+		{"wrapper", dsmlCanonical(content)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: tc.content})
+			if !ok {
+				t.Fatal("a value quoting a complete parameter must not lose the call")
+			}
+			if len(resp.ToolCalls) != 1 {
+				t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+			}
+			if got := resp.ToolCalls[0].Arguments["command"]; got != value {
+				t.Fatalf("command = %q, want the whole quoted value", got)
+			}
+			if got := resp.ToolCalls[0].Arguments["dir"]; got != "/tmp" {
+				t.Fatalf("dir = %v, want /tmp (the parameters after the quoted one must survive)", got)
+			}
+		})
+	}
+}
+
 // TestRecoverDSMLToolCalls_UnclosedParameterDoesNotStealSibling covers an
 // unterminated opener whose <parameter> never closes, followed by a well-formed
 // sibling. Skipping a parameter by searching for its close tag would land on the

@@ -307,23 +307,22 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 			top = stack[len(stack)-1].kind
 		}
 		switch {
-		case !isClose && name == "invoke":
+		case !isClose && (name == "invoke" || name == "parameter"):
 			if top == frameParameter {
-				// Inside a parameter value: quoting a complete tag is text, a
-				// real sibling opener means the parameter never closed.
-				if p, n, c, found := nextStructuralTag(s, tagEnd); found && c && n == "parameter" {
-					i = p
+				// Inside a parameter value. Quoting a complete tag is text: the
+				// value closes right after it, so resume at that close. A real
+				// sibling opener means the parameter never closed.
+				if quotesCompleteTag(s, tagEnd, name) {
+					i = skipQuotedTag(s, tagEnd, name)
 					continue
 				}
 				abandonParameters()
 			}
-			stack = append(stack, frame{kind: frameInvoke, start: i})
-		case !isClose && name == "parameter":
-			if top == frameParameter {
-				// Parameters do not nest: the open one never closed.
-				abandonParameters()
+			kind := frameInvoke
+			if name == "parameter" {
+				kind = frameParameter
 			}
-			stack = append(stack, frame{kind: frameParameter, start: i})
+			stack = append(stack, frame{kind: kind, start: i})
 		case isClose && name == "parameter":
 			if top == frameParameter {
 				stack = stack[:len(stack)-1]
@@ -343,23 +342,65 @@ func scanDSMLInvocations(s string) []dsmlInvokeSpan {
 	return spans
 }
 
-// nextStructuralTag returns the next invoke or parameter tag at or after from,
-// which is how the scanner decides whether a tag inside a parameter value is
-// quoted text or a real sibling.
-func nextStructuralTag(s string, from int) (pos int, name string, isClose bool, ok bool) {
-	for i := from; i < len(s); i++ {
+// quotesCompleteTag reports whether the opener ending at from is being quoted
+// as text inside a parameter value: the element it opens closes again before
+// any sibling element starts. That is how a value like
+//
+//	usa <parameter name="name">x</parameter> y listo
+//
+// is told apart from a real sibling opener, which never closes before the next
+// element begins.
+func quotesCompleteTag(s string, from int, name string) bool {
+	for i := from; i < len(s); {
 		if s[i] != '<' {
+			i++
 			continue
 		}
-		n, c, _, parsed := parseDSMLTagAt(s, i)
+		n, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
 		if !parsed {
+			i++
 			continue
 		}
-		if n == "invoke" || n == "parameter" {
-			return i, n, c, true
+		if isClose && n == name {
+			return true
 		}
+		if !isClose && (n == "invoke" || n == "parameter") {
+			return false
+		}
+		// An invoke opener quoted in a value is never closed by the value: the
+		// value closes right after it, so a </parameter> is enough evidence.
+		if isClose && n == "parameter" && name == "invoke" {
+			return true
+		}
+		i = tagEnd
 	}
-	return 0, "", false, false
+	return false
+}
+
+// skipQuotedTag returns the offset to resume the walk from after a quoted tag
+// opened at from. A quoted <parameter> closes itself, so the walk resumes past
+// its close. A quoted <invoke> does not: the first close belongs to the value,
+// so the walk must stop right before it and let the caller consume it.
+func skipQuotedTag(s string, from int, name string) int {
+	for i := from; i < len(s); {
+		if s[i] != '<' {
+			i++
+			continue
+		}
+		n, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
+		if !parsed {
+			i++
+			continue
+		}
+		if isClose {
+			if name == "invoke" && n == "parameter" {
+				return i
+			}
+			return tagEnd
+		}
+		i = tagEnd
+	}
+	return len(s)
 }
 
 // parseDSMLTagAt parses a DSML opening or closing tag starting at s[start] ==
@@ -383,16 +424,13 @@ func parseDSMLTagAt(s string, start int) (name string, isClose bool, end int, ok
 	if name == "" {
 		return "", false, 0, false
 	}
-	for j < len(s) && s[j] != '>' {
-		if s[j] == '\n' {
-			return "", false, 0, false
-		}
-		j++
-	}
-	if j >= len(s) {
+	// findTagEnd honours quoted attribute values, so a '>' inside one does not
+	// truncate the tag.
+	end = findTagEnd(s, j)
+	if end < 0 {
 		return "", false, 0, false
 	}
-	return name, isClose, j + 1, true
+	return name, isClose, end, true
 }
 
 // findNextDSMLClose returns the offset just past the next closing tag for name
@@ -575,33 +613,35 @@ func parseDSMLInvocations(body string) []protocoltypes.ToolCall {
 	return calls
 }
 
-// parseDSMLParameters extracts parameter elements.
+// parseDSMLParameters extracts the top-level parameter elements of an invoke
+// body.
+//
+// It walks the body with the same rules as the invoke scanner, so a value that
+// quotes a complete <parameter> tag is read as text instead of being taken for
+// a nested element (which would leave the real parameter unterminated and cut
+// the value short).
 func parseDSMLParameters(inner string) map[string]any {
 	args := map[string]any{}
-	i := 0
-	for {
-		start, _, ok := findNextDSMLTag(inner, i, func(n string) bool { return n == "parameter" })
-		if !ok {
+	for i := 0; i < len(inner); {
+		if inner[i] != '<' {
+			i++
+			continue
+		}
+		name, isClose, tagEnd, ok := parseDSMLTagAt(inner, i)
+		if !ok || isClose || name != "parameter" {
+			i++
+			continue
+		}
+		closeStart, end, closed := scanParameterBody(inner, tagEnd)
+		if !closed {
+			// Unterminated parameter: nothing after it can be attributed.
 			break
 		}
-		openEnd := findTagEnd(inner, start)
-		if openEnd < 0 {
-			break
-		}
-		attrs := inner[start:openEnd]
+		attrs := inner[i:tagEnd]
 		paramName := dsmlAttr(attrs, "name")
 		isString := strings.EqualFold(dsmlAttr(attrs, "string"), "true")
-		end, ok := findDSMLClose(inner, openEnd, "</parameter")
-		if !ok {
-			break
-		}
-		raw := inner[openEnd:end]
-		// Trim the closing tag from raw.
-		if idx := strings.LastIndex(raw, "</"); idx >= 0 {
-			raw = raw[:idx]
-		}
 		if paramName != "" {
-			args[paramName] = dsmlParamValue(raw, isString)
+			args[paramName] = dsmlParamValue(inner[tagEnd:closeStart], isString)
 		}
 		i = end
 	}
@@ -609,6 +649,36 @@ func parseDSMLParameters(inner string) map[string]any {
 		return nil
 	}
 	return args
+}
+
+// scanParameterBody returns the offset just past the </parameter> matching the
+// opener whose tag ends at from. A quoted complete <parameter>...</parameter>
+// inside the value is text when the value closes right after it.
+func scanParameterBody(s string, from int) (closeStart int, end int, ok bool) {
+	for i := from; i < len(s); {
+		if s[i] != '<' {
+			i++
+			continue
+		}
+		name, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
+		if !parsed {
+			i++
+			continue
+		}
+		switch {
+		case isClose && name == "parameter":
+			return i, tagEnd, true
+		case !isClose && (name == "parameter" || name == "invoke"):
+			// Quoting a complete tag is text when the value closes right after.
+			if quotesCompleteTag(s, tagEnd, name) {
+				i = skipQuotedTag(s, tagEnd, name)
+				continue
+			}
+			return 0, 0, false
+		}
+		i = tagEnd
+	}
+	return 0, 0, false
 }
 
 // dsmlParamValue decodes a parameter value. Values flagged string="true" are
