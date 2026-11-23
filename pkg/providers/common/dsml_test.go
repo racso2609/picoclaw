@@ -3,6 +3,7 @@ package common
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
@@ -642,5 +643,63 @@ func TestRecoverDSMLToolCalls_UnclosedInvokeDoesNotSwallowLaterProse(t *testing.
 	}
 	if !strings.Contains(resp.Content, "esto no lo cierro") {
 		t.Fatalf("prose between the unclosed opener and the close must survive, got %q", resp.Content)
+	}
+}
+
+// TestRecoverDSMLToolCalls_ParameterMentionsOpener covers a valid block whose
+// parameter value quotes an opener literally (the model documenting its own
+// syntax). The block must still be recovered: a close belongs to the opener it
+// matches, not to a later one that merely appears in text.
+func TestRecoverDSMLToolCalls_ParameterMentionsOpener(t *testing.T) {
+	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
+	body := dsmlParam("command", "echo '"+opener+" es la sintaxis'", true)
+	content := dsmlCanonical(dsmlInvoke("exec", body))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("a valid block must be recovered even if a parameter quotes an opener")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	got, _ := resp.ToolCalls[0].Arguments["command"].(string)
+	if !strings.Contains(got, "es la sintaxis") {
+		t.Fatalf("command = %q, want it to keep the quoted opener", got)
+	}
+}
+
+// TestRecoverDSMLToolCalls_ProseMentionsOpener covers a wrapper whose prose
+// mentions an opener of the same element before the real invoke.
+func TestRecoverDSMLToolCalls_ProseMentionsOpener(t *testing.T) {
+	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
+	content := "<" + fw + fw + "DSML" + fw + fw + "tool_calls>\n" +
+		"Nota: el formato es " + opener + " y luego el parametro.\n" +
+		dsmlInvoke("exec", dsmlParam("command", "echo hola", true)) + "\n" +
+		"</" + fw + fw + "DSML" + fw + fw + "tool_calls>"
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("prose mentioning an opener must not hide the real invoke")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+}
+
+// TestRecoverDSMLToolCalls_UnclosedOpenersStayLinear guards the scan against
+// quadratic behaviour: content full of unclosed openers is model output and
+// must not be able to stall the turn (1.18 MB used to take ~55s).
+func TestRecoverDSMLToolCalls_UnclosedOpenersStayLinear(t *testing.T) {
+	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
+	if testing.Short() {
+		t.Skip("timing test")
+	}
+	for _, n := range []int{1000, 8000, 16000} {
+		content := strings.Repeat(opener, n) + "tail"
+		start := time.Now()
+		RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("n=%d (%d bytes) took %v, want linear", n, len(content), d)
+		}
 	}
 }
