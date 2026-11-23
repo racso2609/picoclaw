@@ -423,22 +423,27 @@ func TestRecoverDSMLToolCalls_EscapedQuoteInAttributeValue(t *testing.T) {
 // using the literal "DSML" spelling between single fullwidth pipes, which is the
 // shape observed in production.
 func dsmlWrapper(name, body string) string {
-	return "<" + fw + "DSML" + fw + " " + name + ">\n" + body + "\n</" + fw + "DSML" + fw + " " + name + ">"
+	return dsmlWrapperLiteral("DSML", name, body)
+}
+
+// dsmlWrapperLiteral is dsmlWrapper with an explicit spelling of the marker.
+func dsmlWrapperLiteral(literal, name, body string) string {
+	return "<" + fw + literal + fw + " " + name + ">\n" + body + "\n</" + fw + literal + fw + " " + name + ">"
 }
 
 func TestRecoverDSMLToolCalls_BlockNameVariants(t *testing.T) {
 	body := dsmlInvoke("exec", dsmlParam("command", "ls -la", true))
 
-	cases := []struct{ name, wrapper string }{
-		{"dropped tool prefix", "calls"},
-		{"space separator", "tool calls"},
-		{"tokenizer word separator", "tool\u2581calls"},
-		{"lowercase marker", "tool_calls"},
-		{"function_call singular", "function_call"},
+	cases := []struct{ name, wrapper, literal string }{
+		{"dropped tool prefix", "calls", "DSML"},
+		{"space separator", "tool calls", "DSML"},
+		{"tokenizer word separator", "tool\u2581calls", "DSML"},
+		{"lowercase marker", "tool_calls", "dsml"},
+		{"function_call singular", "function_call", "DSML"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			content := dsmlWrapper(c.wrapper, body)
+			content := dsmlWrapperLiteral(c.literal, c.wrapper, body)
 			resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
 			if !ok {
 				t.Fatalf("wrapper %q must be recovered", c.wrapper)
@@ -592,5 +597,50 @@ func TestRecoverDSMLToolCalls_SinglePipeMarkerWithoutLiteral(t *testing.T) {
 	}
 	if got := resp.ToolCalls[0].Arguments["command"]; got != "ls" {
 		t.Fatalf("command = %v, want ls", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Guards found by review: widening the matcher must not resurrect markup the
+// model never closed.
+// ---------------------------------------------------------------------------
+
+// TestRecoverDSMLToolCalls_UnterminatedWrapperWithClosedInvokeIsLeftAlone is the
+// falsifiable counterpart of TestRecoverDSMLToolCalls_UnterminatedBlockIsLeftAlone.
+// The older test has no closed invoke inside, so it passed even when the
+// bare-invoke fallback started executing the contents of an unclosed wrapper.
+func TestRecoverDSMLToolCalls_UnterminatedWrapperWithClosedInvokeIsLeftAlone(t *testing.T) {
+	content := "<" + fw + fw + "DSML" + fw + fw + "tool_calls>\n" +
+		dsmlInvoke("exec", dsmlParam("command", "echo inside", true))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if ok {
+		t.Fatalf("an unterminated wrapper must never execute, got %d calls", len(resp.ToolCalls))
+	}
+	if resp.Content != content {
+		t.Fatalf("content must be untouched, got %q", resp.Content)
+	}
+}
+
+// TestRecoverDSMLToolCalls_UnclosedInvokeDoesNotSwallowLaterProse covers a
+// close tag matching an opener that was never closed: taking it would delete the
+// prose in between and execute the wrong command.
+func TestRecoverDSMLToolCalls_UnclosedInvokeDoesNotSwallowLaterProse(t *testing.T) {
+	content := "sintaxis: <" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">\n" +
+		"esto no lo cierro\n" +
+		dsmlInvoke("exec", dsmlParam("command", "echo real", true))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("the closed invoke must still be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo real" {
+		t.Fatalf("command = %v, want 'echo real'", got)
+	}
+	if !strings.Contains(resp.Content, "esto no lo cierro") {
+		t.Fatalf("prose between the unclosed opener and the close must survive, got %q", resp.Content)
 	}
 }

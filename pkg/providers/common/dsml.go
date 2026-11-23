@@ -198,12 +198,14 @@ func findDSMLBlocks(content string) []dsmlBlock {
 	masked := maskCodeRegions(content)
 
 	var blocks []dsmlBlock
+	sawWrapper := false
 	i := 0
 	for {
 		start, name, ok := findNextDSMLTag(masked, i, isDSMLBlockTag)
 		if !ok {
 			break
 		}
+		sawWrapper = true
 		closeTag := "</" + name
 		end, ok := findDSMLClose(masked, start, closeTag)
 		if !ok {
@@ -216,10 +218,14 @@ func findDSMLBlocks(content string) []dsmlBlock {
 		}
 		i = end
 	}
-	if len(blocks) == 0 {
+	if len(blocks) == 0 && !sawWrapper {
 		// Some models drop the wrapper element entirely and emit bare
 		// <..DSML..invoke> tags. Recover those too: the invoke element is
 		// self-describing, so the wrapper adds nothing but a failure mode.
+		//
+		// Only when no wrapper was seen at all: an unterminated wrapper must
+		// stay untouched, and treating the invokes inside it as bare would
+		// execute a block the model never closed.
 		blocks = findBareDSMLInvocations(content, masked)
 	}
 	return blocks
@@ -237,7 +243,10 @@ func findBareDSMLInvocations(content, masked string) []dsmlBlock {
 		}
 		end, ok := findDSMLClose(masked, start, "</invoke")
 		if !ok {
-			break
+			// Skip this opener rather than abort: a later invoke may be
+			// properly closed, and the unterminated one stays visible.
+			i = start + 1
+			continue
 		}
 		body := content[start:end]
 		if calls := parseDSMLInvocations(body); len(calls) > 0 {
@@ -385,10 +394,33 @@ func findDSMLClose(s string, from int, closeTag string) (int, bool) {
 			j++
 		}
 		if j < len(s) && s[j] == '>' {
+			// Reject the close when another opener of the same element sits
+			// between `from` and here: the element being closed was left
+			// unterminated, and taking this close would swallow everything in
+			// between — including user-visible prose.
+			if hasDSMLOpener(s, from, i, want) {
+				return 0, false
+			}
 			return j + 1, true
 		}
 	}
 	return 0, false
+}
+
+// hasDSMLOpener reports whether an opening tag for name starts in
+// s[from:limit). An opener sitting exactly at `from` is the one being closed and
+// is skipped, so callers may pass the offset of the opening tag itself.
+func hasDSMLOpener(s string, from, limit int, name string) bool {
+	accept := func(n string) bool { return n == name }
+	start, _, ok := findNextDSMLTag(s, from, accept)
+	if !ok || start >= limit {
+		return false
+	}
+	if start == from {
+		next, _, ok := findNextDSMLTag(s, from+1, accept)
+		return ok && next < limit
+	}
+	return true
 }
 
 // parseDSMLInvocations extracts every invoke block.
