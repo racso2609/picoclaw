@@ -233,99 +233,133 @@ func findDSMLBlocks(content string) []dsmlBlock {
 
 // findBareDSMLInvocations recovers invoke blocks that appear without a
 // tool_calls wrapper.
-//
-// Invoke elements are siblings, not nested, so each opener is resolved on its
-// own: scan forward from the opener, skipping whole <parameter> elements (their
-// values are text and may legitimately contain markup), and take the first
-// </invoke>. If another <invoke> opener shows up before that close, the opener
-// was never terminated — it must not swallow the close of the well-formed
-// sibling that follows, so it is left visible in the content and the scan
-// resumes at the sibling.
-//
-// A naive "first close after this opener" scan would delete the prose between
-// an unterminated opener and the next valid invoke, and pairing openers and
-// closers LIFO gets a mixed run backwards (two closed invokes around one
-// unclosed opener end up executing the unclosed one with the arguments of the
-// next). Resolving each opener independently keeps the scan linear and leaves
-// orphaned openers visible.
 func findBareDSMLInvocations(content, masked string) []dsmlBlock {
 	var blocks []dsmlBlock
-	i := 0
-	for i < len(masked) {
-		start, _, ok := findNextDSMLTag(masked, i, func(n string) bool { return n == "invoke" })
-		if !ok {
-			break
-		}
-		_, tagEnd, ok := parseDSMLOpenTag(masked, start)
-		if !ok {
-			i = start + 1
-			continue
-		}
-		end, next, closed := findInvokeBodyEnd(masked, tagEnd)
-		if !closed {
-			if next > start {
-				i = next
-			} else {
-				i = start + 1
-			}
-			continue
-		}
-		body := content[start:end]
+	for _, sp := range scanDSMLInvocations(masked) {
+		body := content[sp.start:sp.end]
 		if calls := parseDSMLInvocations(body); len(calls) > 0 {
-			blocks = append(blocks, dsmlBlock{start: start, end: end, calls: calls})
+			blocks = append(blocks, dsmlBlock{start: sp.start, end: sp.end, calls: calls})
 		}
-		i = end
 	}
 	return blocks
 }
 
-// findInvokeBodyEnd scans forward from from (just past an invoke opener) and
-// returns the offset just past the matching </invoke>.
+// dsmlInvokeSpan is a matched invoke element, from its opener to just past its
+// closing tag.
+type dsmlInvokeSpan struct{ start, end int }
+
+// scanDSMLInvocations walks s once and returns the invoke elements that are
+// well-formed, in document order.
 //
-// The scan is a single pass with one bit of state: whether it is inside a
-// <parameter> element. A parameter's value is user-visible text and may quote
-// markup, so openers inside one are text and are ignored; only </parameter>
-// leaves the element. An </invoke> seen while still inside a parameter means
-// the parameter never closed, and that close is the enclosing invoke's.
+// Invoke elements are siblings, not nested, and a model that emits DSML as text
+// can leave any of them unterminated. Two rules keep that from turning into
+// executing the wrong tool:
 //
-// A sibling <invoke> opener reached outside any parameter means this element
-// was never terminated: ok is false and next is that sibling's offset, so the
-// caller resumes there instead of rescanning. When the scan runs out of input
-// without finding any close, next is len(s): no later opener can be closed
-// either, so the caller stops. Both rules are what keep the pass linear even
-// when every opener is followed by an unterminated parameter.
-func findInvokeBodyEnd(s string, from int) (end int, next int, ok bool) {
-	inParam := false
-	for i := from; i < len(s); {
+//   - An unterminated element is never returned. Its opener stays visible in
+//     the content, so nothing is executed on its behalf.
+//   - A parameter that never closes invalidates the invoke that contains it: a
+//     body whose parameters do not line up cannot be attributed to the right
+//     tool, so it is not executed either.
+//
+// A parameter's value is user-visible text and may quote markup, so an
+// <invoke> opener found inside one is treated as text when the value closes
+// right after it (the value is quoting a complete tag) and as a sibling opener
+// otherwise. That lookahead is bounded by the next structural tag, which the
+// walk then consumes, so the whole scan stays linear.
+func scanDSMLInvocations(s string) []dsmlInvokeSpan {
+	const (
+		frameInvoke = iota
+		frameParameter
+	)
+	type frame struct {
+		kind      int
+		start     int
+		abandoned int
+	}
+
+	var stack []frame
+	var spans []dsmlInvokeSpan
+
+	abandonParameters := func() {
+		for len(stack) > 0 && stack[len(stack)-1].kind == frameParameter {
+			stack = stack[:len(stack)-1]
+			for i := len(stack) - 1; i >= 0; i-- {
+				if stack[i].kind == frameInvoke {
+					stack[i].abandoned++
+					break
+				}
+			}
+		}
+	}
+
+	for i := 0; i < len(s); {
 		if s[i] != '<' {
 			i++
 			continue
 		}
-		name, isClose, tagEnd, parsed := parseDSMLTagAt(s, i)
-		if !parsed {
+		name, isClose, tagEnd, ok := parseDSMLTagAt(s, i)
+		if !ok {
 			i++
 			continue
 		}
+		top := -1
+		if len(stack) > 0 {
+			top = stack[len(stack)-1].kind
+		}
 		switch {
-		case inParam:
-			switch {
-			case isClose && name == "parameter":
-				inParam = false
-			case isClose && name == "invoke":
-				// The parameter never closed; this close is the invoke's.
-				return tagEnd, 0, true
-			}
-			// Anything else, including a quoted opener, is parameter text.
-		case !isClose && name == "parameter":
-			inParam = true
-		case isClose && name == "invoke":
-			return tagEnd, 0, true
 		case !isClose && name == "invoke":
-			return 0, i, false
+			if top == frameParameter {
+				// Inside a parameter value: quoting a complete tag is text, a
+				// real sibling opener means the parameter never closed.
+				if p, n, c, found := nextStructuralTag(s, tagEnd); found && c && n == "parameter" {
+					i = p
+					continue
+				}
+				abandonParameters()
+			}
+			stack = append(stack, frame{kind: frameInvoke, start: i})
+		case !isClose && name == "parameter":
+			if top == frameParameter {
+				// Parameters do not nest: the open one never closed.
+				abandonParameters()
+			}
+			stack = append(stack, frame{kind: frameParameter, start: i})
+		case isClose && name == "parameter":
+			if top == frameParameter {
+				stack = stack[:len(stack)-1]
+			}
+		case isClose && name == "invoke":
+			abandonParameters()
+			if n := len(stack); n > 0 && stack[n-1].kind == frameInvoke {
+				f := stack[n-1]
+				stack = stack[:n-1]
+				if f.abandoned == 0 {
+					spans = append(spans, dsmlInvokeSpan{start: f.start, end: tagEnd})
+				}
+			}
 		}
 		i = tagEnd
 	}
-	return 0, len(s), false
+	return spans
+}
+
+// nextStructuralTag returns the next invoke or parameter tag at or after from,
+// which is how the scanner decides whether a tag inside a parameter value is
+// quoted text or a real sibling.
+func nextStructuralTag(s string, from int) (pos int, name string, isClose bool, ok bool) {
+	for i := from; i < len(s); i++ {
+		if s[i] != '<' {
+			continue
+		}
+		n, c, _, parsed := parseDSMLTagAt(s, i)
+		if !parsed {
+			continue
+		}
+		if n == "invoke" || n == "parameter" {
+			return i, n, c, true
+		}
+	}
+	return 0, "", false, false
 }
 
 // parseDSMLTagAt parses a DSML opening or closing tag starting at s[start] ==
@@ -511,47 +545,32 @@ func findDSMLClose(s string, from int, closeTag string) (int, bool) {
 	return findNextDSMLClose(s, from, strings.TrimPrefix(closeTag, "</"))
 }
 
-// parseDSMLInvocations extracts every invoke block.
+// parseDSMLInvocations extracts every well-formed invoke element in body.
 func parseDSMLInvocations(body string) []protocoltypes.ToolCall {
 	var calls []protocoltypes.ToolCall
-	i := 0
-	for {
-		start, _, ok := findNextDSMLTag(body, i, func(n string) bool { return n == "invoke" })
+	for _, sp := range scanDSMLInvocations(body) {
+		_, tagEnd, ok := parseDSMLOpenTag(body, sp.start)
 		if !ok {
-			break
+			continue
 		}
-		openEnd := findTagEnd(body, start)
-		if openEnd < 0 {
-			break
+		toolName := dsmlAttr(body[sp.start:tagEnd], "name")
+		if toolName == "" {
+			continue
 		}
-		attrs := body[start:openEnd]
-		toolName := dsmlAttr(attrs, "name")
-		// Resolve this invoke on its own: an unterminated opener must not take
-		// the close of the well-formed sibling that follows it.
-		end, next, closed := findInvokeBodyEnd(body, openEnd)
-		if !closed {
-			if next > start {
-				i = next
-				continue
-			}
-			break
+		args := parseDSMLParameters(body[tagEnd:sp.end])
+		if args == nil {
+			continue
 		}
-		inner := body[openEnd:end]
-		if toolName != "" {
-			if args := parseDSMLParameters(inner); args != nil {
-				calls = append(calls, protocoltypes.ToolCall{
-					ID:        newDSMLCallID(len(calls)),
-					Type:      "function",
-					Name:      toolName,
-					Arguments: args,
-					Function: &protocoltypes.FunctionCall{
-						Name:      toolName,
-						Arguments: mustJSON(args),
-					},
-				})
-			}
-		}
-		i = end
+		calls = append(calls, protocoltypes.ToolCall{
+			ID:        newDSMLCallID(len(calls)),
+			Type:      "function",
+			Name:      toolName,
+			Arguments: args,
+			Function: &protocoltypes.FunctionCall{
+				Name:      toolName,
+				Arguments: mustJSON(args),
+			},
+		})
 	}
 	return calls
 }

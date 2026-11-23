@@ -684,6 +684,36 @@ func TestRecoverDSMLToolCalls_BareParameterMentionsOpener(t *testing.T) {
 	}
 }
 
+// TestRecoverDSMLToolCalls_UnclosedParameterDoesNotStealSibling covers an
+// unterminated opener whose <parameter> never closes, followed by a well-formed
+// sibling. Skipping a parameter by searching for its close tag would land on the
+// sibling's </parameter>, then take the sibling's </invoke>: the orphan would run
+// with the sibling's arguments.
+func TestRecoverDSMLToolCalls_UnclosedParameterDoesNotStealSibling(t *testing.T) {
+	opener := func(n string) string {
+		return "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"" + n + "\">"
+	}
+	param := func(n string) string {
+		return "<" + fw + fw + "DSML" + fw + fw + "parameter name=\"" + n + "\" string=\"true\">"
+	}
+	content := opener("orphan") + "\n" + param("x") + "sin cerrar\n" +
+		dsmlInvoke("real", dsmlParam("command", "echo real", true))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("the well-formed sibling must be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].Name != "real" {
+		t.Fatalf("name = %q, want 'real' (the orphan must not run)", resp.ToolCalls[0].Name)
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo real" {
+		t.Fatalf("command = %v, want 'echo real'", got)
+	}
+}
+
 // TestRecoverDSMLToolCalls_WrapperUnclosedInvokeBeforeValid covers a closed
 // wrapper holding an unterminated invoke followed by a well-formed one. The
 // valid invoke must be the one executed: taking the orphan would run a tool the
