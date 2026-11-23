@@ -2252,6 +2252,52 @@ func TestProviderChat_RecoversDSMLToolCallsFromContent(t *testing.T) {
 	}
 }
 
+// TestProviderChat_RecoversDSMLDroppedToolPrefix is the end-to-end counterpart
+// of the block-name variants: the wrapper arrives as "<..DSML.. calls>" and the
+// call must still reach the runtime as a structured tool call.
+func TestProviderChat_RecoversDSMLDroppedToolPrefix(t *testing.T) {
+	fw := "\uFF5C"
+	// Shape observed in production: literal DSML between single pipes and the
+	// "tool" prefix dropped, so the wrapper reads "calls".
+	markup := "<" + fw + "DSML" + fw + " calls>\n" +
+		"<" + fw + "DSML" + fw + " invoke name=\"exec\">\n" +
+		"<" + fw + "DSML" + fw + " parameter name=\"command\" string=\"true\">ls</" + fw + "DSML" + fw + " parameter>\n" +
+		"</" + fw + "DSML" + fw + " invoke>\n" +
+		"</" + fw + "DSML" + fw + " calls>"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{
+					"message":       map[string]any{"content": markup},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	out, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deepseek-v4", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1 (content %q)", len(out.ToolCalls), out.Content)
+	}
+	if out.ToolCalls[0].Name != "exec" {
+		t.Fatalf("Name = %q, want exec", out.ToolCalls[0].Name)
+	}
+	if out.ToolCalls[0].Arguments["command"] != "ls" {
+		t.Fatalf("command = %v, want ls", out.ToolCalls[0].Arguments["command"])
+	}
+	if strings.Contains(out.Content, "DSML") {
+		t.Fatalf("markup leaked into content: %q", out.Content)
+	}
+}
+
 // A model that merely *talks about* the markup inside a code fence must not
 // trigger execution.
 func TestProviderChat_DoesNotExecuteDSMLInsideCodeFence(t *testing.T) {

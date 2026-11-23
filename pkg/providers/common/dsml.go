@@ -41,7 +41,90 @@ import (
 const (
 	dsmlFullwidthPipe = "\uFF5C"
 	dsmlASCIIPipe     = "|"
+	// dsmlWordSep is U+2581 LOWER ONE EIGHTH BLOCK, the word separator in
+	// DeepSeek's tokenizer. A model that renders its own markup as text can
+	// turn "tool_calls" into "tool\u2581calls".
+	dsmlWordSep = "\u2581"
 )
+
+// dsmlNameAliases maps the spellings models actually emit to the canonical
+// element name. DeepSeek's tokenizer splits "tool_calls" into "tool" + " calls",
+// and models frequently drop the "tool" prefix altogether, so the wrapper
+// arrives as "<..DSML.. calls>" instead of "<..DSML..tool_calls>".
+var dsmlNameAliases = map[string]string{
+	"calls":         "tool_calls",
+	"call":          "tool_call",
+	"toolcalls":     "tool_calls",
+	"toolcall":      "tool_call",
+	"functioncall":  "function_call",
+	"functioncalls": "function_calls",
+}
+
+// normalizeDSMLName returns the canonical spelling of an element name.
+func normalizeDSMLName(name string) string {
+	if canon, ok := dsmlNameAliases[name]; ok {
+		return canon
+	}
+	return name
+}
+
+// dsmlNameSepLen reports the length of a word separator inside an element name.
+func dsmlNameSepLen(s string, i int) int {
+	if i < len(s) && s[i] == ' ' {
+		return 1
+	}
+	if strings.HasPrefix(s[i:], dsmlWordSep) {
+		return len(dsmlWordSep)
+	}
+	return 0
+}
+
+// readDSMLName reads an element name at s[i]. A single word separator is
+// re-joined when the two halves form a known compound, so "tool calls" and
+// "tool\u2581calls" both read as "tool_calls". The returned name is canonical.
+func readDSMLName(s string, i int) (string, int) {
+	start := i
+	for i < len(s) && isDSMLNameByte(s[i]) {
+		i++
+	}
+	if i == start {
+		return "", i
+	}
+	name := s[start:i]
+
+	sep := dsmlNameSepLen(s, i)
+	if sep == 0 {
+		return normalizeDSMLName(name), i
+	}
+	k := i + sep
+	restStart := k
+	for k < len(s) && isDSMLNameByte(s[k]) {
+		k++
+	}
+	if k == restStart {
+		return normalizeDSMLName(name), i
+	}
+	joined := name + "_" + s[restStart:k]
+	if canon := normalizeDSMLName(joined); canon != joined {
+		return canon, k
+	}
+	switch joined {
+	case "tool_calls", "tool_call", "function_calls", "function_call":
+		return joined, k
+	}
+	return normalizeDSMLName(name), i
+}
+
+// containsFold reports whether s contains sub, ignoring ASCII case.
+func containsFold(s, sub string) bool {
+	n := len(sub)
+	for i := 0; i+n <= len(s); i++ {
+		if strings.EqualFold(s[i:i+n], sub) {
+			return true
+		}
+	}
+	return false
+}
 
 // dsmlBlock is a parsed tool-call block.
 type dsmlBlock struct {
@@ -101,12 +184,12 @@ func RecoverDSMLToolCalls(resp *protocoltypes.LLMResponse) (*protocoltypes.LLMRe
 // looksLikeDSML is a cheap pre-filter so that the (more expensive) masking and
 // scanning only run for content that could plausibly carry the markup.
 func looksLikeDSML(content string) bool {
-	if strings.Contains(content, "DSML") {
+	if containsFold(content, "DSML") {
 		return true
 	}
-	// Bare markers: "<" followed by two fullwidth pipes.
-	return strings.Contains(content, "<"+dsmlFullwidthPipe+dsmlFullwidthPipe) ||
-		strings.Contains(content, "</"+dsmlFullwidthPipe+dsmlFullwidthPipe)
+	// Bare markers: "<" followed by one or two fullwidth pipes.
+	return strings.Contains(content, "<"+dsmlFullwidthPipe) ||
+		strings.Contains(content, "</"+dsmlFullwidthPipe)
 }
 
 // findDSMLBlocks locates every executable DSML block in content, skipping
@@ -133,12 +216,41 @@ func findDSMLBlocks(content string) []dsmlBlock {
 		}
 		i = end
 	}
+	if len(blocks) == 0 {
+		// Some models drop the wrapper element entirely and emit bare
+		// <..DSML..invoke> tags. Recover those too: the invoke element is
+		// self-describing, so the wrapper adds nothing but a failure mode.
+		blocks = findBareDSMLInvocations(content, masked)
+	}
+	return blocks
+}
+
+// findBareDSMLInvocations recovers invoke blocks that appear without a
+// tool_calls wrapper.
+func findBareDSMLInvocations(content, masked string) []dsmlBlock {
+	var blocks []dsmlBlock
+	i := 0
+	for {
+		start, _, ok := findNextDSMLTag(masked, i, func(n string) bool { return n == "invoke" })
+		if !ok {
+			break
+		}
+		end, ok := findDSMLClose(masked, start, "</invoke")
+		if !ok {
+			break
+		}
+		body := content[start:end]
+		if calls := parseDSMLInvocations(body); len(calls) > 0 {
+			blocks = append(blocks, dsmlBlock{start: start, end: end, calls: calls})
+		}
+		i = end
+	}
 	return blocks
 }
 
 func isDSMLBlockTag(name string) bool {
 	switch name {
-	case "tool_calls", "tool_call", "function_calls":
+	case "tool_calls", "tool_call", "function_calls", "function_call":
 		return true
 	}
 	return false
@@ -173,14 +285,10 @@ func parseDSMLOpenTag(s string, start int) (name string, end int, ok bool) {
 	for j < len(s) && s[j] == ' ' {
 		j++
 	}
-	nameStart := j
-	for j < len(s) && isDSMLNameByte(s[j]) {
-		j++
-	}
-	if j == nameStart {
+	name, j = readDSMLName(s, j)
+	if name == "" {
 		return "", 0, false
 	}
-	name = s[nameStart:j]
 	// Skip attributes up to '>'
 	for j < len(s) && s[j] != '>' {
 		if s[j] == '\n' {
@@ -223,7 +331,7 @@ func markerLenOrZero(j, i int, consumed bool, s string) int {
 		return 0
 	}
 	// Optional "DSML" spelling right after the marker(s).
-	if strings.HasPrefix(s[j:], "DSML") {
+	if len(s) >= j+len("DSML") && strings.EqualFold(s[j:j+len("DSML")], "DSML") {
 		j += len("DSML")
 		// Trailing marker(s) after DSML, e.g. doubled fullwidth pipe.
 		for j < len(s) {
@@ -247,7 +355,7 @@ func isDSMLNameByte(b byte) bool {
 
 // findDSMLClose finds the closing tag for name starting at or after from.
 func findDSMLClose(s string, from int, closeTag string) (int, bool) {
-	want := strings.TrimPrefix(closeTag, "</")
+	want := normalizeDSMLName(strings.TrimPrefix(closeTag, "</"))
 	for i := from; i < len(s); i++ {
 		if s[i] != '<' {
 			continue
@@ -266,14 +374,18 @@ func findDSMLClose(s string, from int, closeTag string) (int, bool) {
 		for j < len(s) && s[j] == ' ' {
 			j++
 		}
-		if strings.HasPrefix(s[j:], want) {
-			k := j + len(want)
-			for k < len(s) && s[k] != '>' {
-				k++
+		got, j := readDSMLName(s, j)
+		if got == "" || got != want {
+			continue
+		}
+		for j < len(s) && s[j] != '>' {
+			if s[j] == '\n' {
+				break
 			}
-			if k < len(s) {
-				return k + 1, true
-			}
+			j++
+		}
+		if j < len(s) && s[j] == '>' {
+			return j + 1, true
 		}
 	}
 	return 0, false

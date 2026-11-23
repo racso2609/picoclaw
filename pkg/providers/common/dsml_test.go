@@ -408,3 +408,189 @@ func TestRecoverDSMLToolCalls_EscapedQuoteInAttributeValue(t *testing.T) {
 		t.Fatalf("command = %v, want ls (args %v)", got, resp.ToolCalls[0].Arguments)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Block-name variants.
+//
+// DeepSeek's tokenizer splits "tool_calls" into "tool" + " calls" (U+2581 is its
+// word separator), and models routinely drop the "tool" prefix or lowercase the
+// literal marker. The wrapper then arrives as "<..DSML.. calls>" instead of
+// "<..DSML..tool_calls>", which the original matcher rejected: the markup was
+// forwarded to the user as text and nothing executed.
+// ---------------------------------------------------------------------------
+
+// dsmlWrapper builds a wrapper element with an arbitrary (non-canonical) name,
+// using the literal "DSML" spelling between single fullwidth pipes, which is the
+// shape observed in production.
+func dsmlWrapper(name, body string) string {
+	return "<" + fw + "DSML" + fw + " " + name + ">\n" + body + "\n</" + fw + "DSML" + fw + " " + name + ">"
+}
+
+func TestRecoverDSMLToolCalls_BlockNameVariants(t *testing.T) {
+	body := dsmlInvoke("exec", dsmlParam("command", "ls -la", true))
+
+	cases := []struct{ name, wrapper string }{
+		{"dropped tool prefix", "calls"},
+		{"space separator", "tool calls"},
+		{"tokenizer word separator", "tool\u2581calls"},
+		{"lowercase marker", "tool_calls"},
+		{"function_call singular", "function_call"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			content := dsmlWrapper(c.wrapper, body)
+			resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+			if !ok {
+				t.Fatalf("wrapper %q must be recovered", c.wrapper)
+			}
+			if len(resp.ToolCalls) != 1 {
+				t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+			}
+			if got := resp.ToolCalls[0].Arguments["command"]; got != "ls -la" {
+				t.Fatalf("command = %v, want 'ls -la'", got)
+			}
+			if strings.Contains(resp.Content, "DSML") {
+				t.Fatalf("markup must be stripped, got %q", resp.Content)
+			}
+		})
+	}
+}
+
+// TestRecoverDSMLToolCalls_RealProductionPayload is the exact content that
+// reached the user on 2026-11-23 (two agents, same shape): the wrapper is
+// "<..DSML.. calls>" and the first invoke repeats the "action" parameter.
+func TestRecoverDSMLToolCalls_RealProductionPayload(t *testing.T) {
+	content := "\n\n" +
+		"<" + fw + "DSML" + fw + " calls>\n" +
+		"<" + fw + "DSML" + fw + " invoke name=\"exec\">\n" +
+		"<" + fw + "DSML" + fw + " parameter name=\"action\" string=\"true\">run</" + fw + "DSML" + fw + " parameter>\n" +
+		"<" + fw + "DSML" + fw + " parameter name=\"action\" string=\"true\">run</" + fw + "DSML" + fw + " parameter>\n" +
+		"<" + fw + "DSML" + fw + " parameter name=\"command\" string=\"true\">echo hola</" + fw + "DSML" + fw + " parameter>\n" +
+		"</" + fw + "DSML" + fw + " invoke>\n" +
+		"<" + fw + "DSML" + fw + " invoke name=\"exec\">\n" +
+		"<" + fw + "DSML" + fw + " parameter name=\"command\" string=\"true\">git diff main</" + fw + "DSML" + fw + " parameter>\n" +
+		"</" + fw + "DSML" + fw + " invoke>\n" +
+		"</" + fw + "DSML" + fw + " calls>"
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("the production payload must be recovered")
+	}
+	if len(resp.ToolCalls) != 2 {
+		t.Fatalf("len(ToolCalls) = %d, want 2", len(resp.ToolCalls))
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo hola" {
+		t.Fatalf("first command = %v, want 'echo hola'", got)
+	}
+	// The duplicated "action" parameter must collapse to a single value rather
+	// than producing a broken argument map.
+	if got := resp.ToolCalls[0].Arguments["action"]; got != "run" {
+		t.Fatalf("action = %v, want 'run'", got)
+	}
+	if got := resp.ToolCalls[1].Arguments["command"]; got != "git diff main" {
+		t.Fatalf("second command = %v, want 'git diff main'", got)
+	}
+	if resp.FinishReason != "tool_calls" {
+		t.Fatalf("FinishReason = %q, want tool_calls", resp.FinishReason)
+	}
+}
+
+// TestRecoverDSMLToolCalls_BareInvokeWithoutWrapper covers a model that emits
+// the invoke element without the tool_calls wrapper at all.
+func TestRecoverDSMLToolCalls_BareInvokeWithoutWrapper(t *testing.T) {
+	content := "\n\n" + dsmlInvoke("exec", dsmlParam("command", "pwd", true))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("a bare invoke must be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	if resp.Content != "" {
+		t.Fatalf("the invoke must be stripped from content, got %q", resp.Content)
+	}
+}
+
+// TestRecoverDSMLToolCalls_BareInvokeInsideFenceIsIgnored is the falsifiable
+// counterpart of the bare-invoke fallback: widening the matcher must not start
+// executing markup that a model is merely quoting.
+func TestRecoverDSMLToolCalls_BareInvokeInsideFenceIsIgnored(t *testing.T) {
+	content := "Look at this:\n\n```\n" + dsmlInvoke("exec", dsmlParam("command", "rm -rf /", true)) + "\n```\n"
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if ok {
+		t.Fatalf("markup inside a fence must never execute, got %d calls", len(resp.ToolCalls))
+	}
+	if resp.Content != content {
+		t.Fatalf("content must be untouched")
+	}
+}
+
+// TestRecoverDSMLToolCalls_BareInvokeWithoutParametersIsIgnored guards the
+// fallback against executing a bare, parameterless invoke.
+func TestRecoverDSMLToolCalls_BareInvokeWithoutParametersIsIgnored(t *testing.T) {
+	content := "I would call " + dsmlInvoke("exec", "") + " here."
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if ok {
+		t.Fatalf("a parameterless invoke must not execute, got %d calls", len(resp.ToolCalls))
+	}
+	if resp.Content != content {
+		t.Fatalf("content must be untouched")
+	}
+}
+
+// TestRecoverDSMLToolCalls_InvokeElementNameIsNotMerged is a regression guard
+// for the name re-joining logic: "invoke name=..." must keep reading as the
+// element "invoke" with a "name" attribute, never as "invoke_name".
+func TestRecoverDSMLToolCalls_InvokeElementNameIsNotMerged(t *testing.T) {
+	content := dsmlCanonical(dsmlInvoke("exec", dsmlParam("command", "ls", true)))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok || len(resp.ToolCalls) != 1 {
+		t.Fatalf("expected 1 call, got %d (ok=%v)", len(resp.ToolCalls), ok)
+	}
+	if resp.ToolCalls[0].Name != "exec" {
+		t.Fatalf("name = %q, want exec", resp.ToolCalls[0].Name)
+	}
+}
+
+// TestRecoverDSMLToolCalls_LowercaseMarkerLiteral covers the literal marker
+// spelled "dsml" instead of "DSML". Matching it case-sensitively drops the
+// whole block.
+func TestRecoverDSMLToolCalls_LowercaseMarkerLiteral(t *testing.T) {
+	// The whole payload is lowercase, including the invoke element: otherwise
+	// the bare-invoke fallback would recover the call and hide the regression.
+	invoke := "<" + fw + "dsml" + fw + " invoke name=\"exec\">\n" +
+		"<" + fw + "dsml" + fw + " parameter name=\"command\" string=\"true\">ls</" + fw + "dsml" + fw + " parameter>\n" +
+		"</" + fw + "dsml" + fw + " invoke>"
+	content := "<" + fw + "dsml" + fw + " tool_calls>\n" + invoke + "\n</" + fw + "dsml" + fw + " tool_calls>"
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("a lowercase 'dsml' marker must still be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+}
+
+// TestRecoverDSMLToolCalls_SinglePipeMarkerWithoutLiteral covers the marker
+// written as a single fullwidth pipe and no "DSML" spelling at all. The cheap
+// pre-filter must not reject it before the real parser runs.
+func TestRecoverDSMLToolCalls_SinglePipeMarkerWithoutLiteral(t *testing.T) {
+	invoke := "<" + fw + "invoke name=\"exec\">\n" + "<" + fw + "parameter name=\"command\" string=\"true\">ls</" + fw + "parameter>\n</" + fw + "invoke>"
+	content := "<" + fw + "tool_calls>\n" + invoke + "\n</" + fw + "tool_calls>"
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("a single-pipe marker must be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "ls" {
+		t.Fatalf("command = %v, want ls", got)
+	}
+}
