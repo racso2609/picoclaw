@@ -510,8 +510,14 @@ func parseDSMLInvocations(body string) []protocoltypes.ToolCall {
 		}
 		attrs := body[start:openEnd]
 		toolName := dsmlAttr(attrs, "name")
-		end, ok := findDSMLClose(body, openEnd, "</invoke")
-		if !ok {
+		// Resolve this invoke on its own: an unterminated opener must not take
+		// the close of the well-formed sibling that follows it.
+		end, next, closed := findInvokeBodyEnd(body, openEnd)
+		if !closed {
+			if next > start {
+				i = next
+				continue
+			}
 			break
 		}
 		inner := body[openEnd:end]

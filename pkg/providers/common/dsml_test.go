@@ -1,6 +1,7 @@
 package common
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -662,6 +663,55 @@ func TestRecoverDSMLToolCalls_UnclosedInvokeDoesNotSwallowLaterProse(t *testing.
 	}
 }
 
+// TestRecoverDSMLToolCalls_BareParameterMentionsOpener covers the same case as
+// ParameterMentionsOpener but without a wrapper: the bare path must skip a
+// parameter's value before looking for structural tags, or the quoted opener is
+// taken for a sibling and the block is dropped.
+func TestRecoverDSMLToolCalls_BareParameterMentionsOpener(t *testing.T) {
+	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
+	content := dsmlInvoke("exec", dsmlParam("command", "echo '"+opener+" es la sintaxis'", true))
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("a bare invoke quoting an opener in a parameter must be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	got, _ := resp.ToolCalls[0].Arguments["command"].(string)
+	if !strings.Contains(got, "es la sintaxis") {
+		t.Fatalf("command = %q, want it to keep the quoted opener", got)
+	}
+}
+
+// TestRecoverDSMLToolCalls_WrapperUnclosedInvokeBeforeValid covers a closed
+// wrapper holding an unterminated invoke followed by a well-formed one. The
+// valid invoke must be the one executed: taking the orphan would run a tool the
+// model never closed and hand it the sibling's arguments.
+func TestRecoverDSMLToolCalls_WrapperUnclosedInvokeBeforeValid(t *testing.T) {
+	opener := func(n string) string {
+		return "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"" + n + "\">"
+	}
+	content := dsmlCanonical(
+		opener("orphan") + "\nesto no lo cierro\n" +
+			dsmlInvoke("real", dsmlParam("command", "echo real", true)),
+	)
+
+	resp, ok := RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+	if !ok {
+		t.Fatal("the well-formed invoke must be recovered")
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("len(ToolCalls) = %d, want 1", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].Name != "real" {
+		t.Fatalf("name = %q, want 'real' (the orphan must not be executed)", resp.ToolCalls[0].Name)
+	}
+	if got := resp.ToolCalls[0].Arguments["command"]; got != "echo real" {
+		t.Fatalf("command = %v, want 'echo real'", got)
+	}
+}
+
 // TestRecoverDSMLToolCalls_UnclosedOpenerBetweenClosedSiblings covers a bare run
 // where an unterminated opener sits between two well-formed invokes. Invoke
 // elements are siblings, so the closed ones must both be recovered and the
@@ -742,17 +792,43 @@ func TestRecoverDSMLToolCalls_ProseMentionsOpener(t *testing.T) {
 // TestRecoverDSMLToolCalls_UnclosedOpenersStayLinear guards the scan against
 // quadratic behaviour: content full of unclosed openers is model output and
 // must not be able to stall the turn (1.18 MB used to take ~55s).
+//
+// The check is a ratio, not an absolute deadline: a wall-clock threshold is
+// flaky on a loaded CI box and would not notice a superlinear curve that stays
+// under it. Quadrupling the input must not multiply the time by more than a
+// generous constant; a quadratic scan lands around 16x.
 func TestRecoverDSMLToolCalls_UnclosedOpenersStayLinear(t *testing.T) {
 	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
 	if testing.Short() {
 		t.Skip("timing test")
 	}
-	for _, n := range []int{1000, 8000, 16000} {
+	measure := func(n int) time.Duration {
 		content := strings.Repeat(opener, n) + "tail"
 		start := time.Now()
 		RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
-		if d := time.Since(start); d > 2*time.Second {
-			t.Fatalf("n=%d (%d bytes) took %v, want linear", n, len(content), d)
-		}
+		return time.Since(start)
+	}
+	measure(250) // warm up
+	small := measure(4000)
+	large := measure(16000)
+	if small < time.Millisecond {
+		small = time.Millisecond // avoid dividing by a timer-resolution zero
+	}
+	if ratio := float64(large) / float64(small); ratio > 8 {
+		t.Fatalf("4x the input took %.1fx the time (%v -> %v), want linear", ratio, small, large)
+	}
+}
+
+// BenchmarkRecoverDSMLToolCalls_UnclosedOpeners keeps the linearity claim
+// measurable without a wall-clock assertion.
+func BenchmarkRecoverDSMLToolCalls_UnclosedOpeners(b *testing.B) {
+	opener := "<" + fw + fw + "DSML" + fw + fw + "invoke name=\"exec\">"
+	for _, n := range []int{1000, 4000, 16000} {
+		content := strings.Repeat(opener, n) + "tail"
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				RecoverDSMLToolCalls(&protocoltypes.LLMResponse{Content: content})
+			}
+		})
 	}
 }
