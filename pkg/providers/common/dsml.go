@@ -41,7 +41,90 @@ import (
 const (
 	dsmlFullwidthPipe = "\uFF5C"
 	dsmlASCIIPipe     = "|"
+	// dsmlWordSep is U+2581 LOWER ONE EIGHTH BLOCK, the word separator in
+	// DeepSeek's tokenizer. A model that renders its own markup as text can
+	// turn "tool_calls" into "tool\u2581calls".
+	dsmlWordSep = "\u2581"
 )
+
+// dsmlNameAliases maps the spellings models actually emit to the canonical
+// element name. DeepSeek's tokenizer splits "tool_calls" into "tool" + " calls",
+// and models frequently drop the "tool" prefix altogether, so the wrapper
+// arrives as "<..DSML.. calls>" instead of "<..DSML..tool_calls>".
+var dsmlNameAliases = map[string]string{
+	"calls":         "tool_calls",
+	"call":          "tool_call",
+	"toolcalls":     "tool_calls",
+	"toolcall":      "tool_call",
+	"functioncall":  "function_call",
+	"functioncalls": "function_calls",
+}
+
+// normalizeDSMLName returns the canonical spelling of an element name.
+func normalizeDSMLName(name string) string {
+	if canon, ok := dsmlNameAliases[name]; ok {
+		return canon
+	}
+	return name
+}
+
+// dsmlNameSepLen reports the length of a word separator inside an element name.
+func dsmlNameSepLen(s string, i int) int {
+	if i < len(s) && s[i] == ' ' {
+		return 1
+	}
+	if strings.HasPrefix(s[i:], dsmlWordSep) {
+		return len(dsmlWordSep)
+	}
+	return 0
+}
+
+// readDSMLName reads an element name at s[i]. A single word separator is
+// re-joined when the two halves form a known compound, so "tool calls" and
+// "tool\u2581calls" both read as "tool_calls". The returned name is canonical.
+func readDSMLName(s string, i int) (string, int) {
+	start := i
+	for i < len(s) && isDSMLNameByte(s[i]) {
+		i++
+	}
+	if i == start {
+		return "", i
+	}
+	name := s[start:i]
+
+	sep := dsmlNameSepLen(s, i)
+	if sep == 0 {
+		return normalizeDSMLName(name), i
+	}
+	k := i + sep
+	restStart := k
+	for k < len(s) && isDSMLNameByte(s[k]) {
+		k++
+	}
+	if k == restStart {
+		return normalizeDSMLName(name), i
+	}
+	joined := name + "_" + s[restStart:k]
+	if canon := normalizeDSMLName(joined); canon != joined {
+		return canon, k
+	}
+	switch joined {
+	case "tool_calls", "tool_call", "function_calls", "function_call":
+		return joined, k
+	}
+	return normalizeDSMLName(name), i
+}
+
+// containsFold reports whether s contains sub, ignoring ASCII case.
+func containsFold(s, sub string) bool {
+	n := len(sub)
+	for i := 0; i+n <= len(s); i++ {
+		if strings.EqualFold(s[i:i+n], sub) {
+			return true
+		}
+	}
+	return false
+}
 
 // dsmlBlock is a parsed tool-call block.
 type dsmlBlock struct {
@@ -101,12 +184,12 @@ func RecoverDSMLToolCalls(resp *protocoltypes.LLMResponse) (*protocoltypes.LLMRe
 // looksLikeDSML is a cheap pre-filter so that the (more expensive) masking and
 // scanning only run for content that could plausibly carry the markup.
 func looksLikeDSML(content string) bool {
-	if strings.Contains(content, "DSML") {
+	if containsFold(content, "DSML") {
 		return true
 	}
-	// Bare markers: "<" followed by two fullwidth pipes.
-	return strings.Contains(content, "<"+dsmlFullwidthPipe+dsmlFullwidthPipe) ||
-		strings.Contains(content, "</"+dsmlFullwidthPipe+dsmlFullwidthPipe)
+	// Bare markers: "<" followed by one or two fullwidth pipes.
+	return strings.Contains(content, "<"+dsmlFullwidthPipe) ||
+		strings.Contains(content, "</"+dsmlFullwidthPipe)
 }
 
 // findDSMLBlocks locates every executable DSML block in content, skipping
@@ -115,12 +198,14 @@ func findDSMLBlocks(content string) []dsmlBlock {
 	masked := maskCodeRegions(content)
 
 	var blocks []dsmlBlock
+	sawWrapper := false
 	i := 0
 	for {
 		start, name, ok := findNextDSMLTag(masked, i, isDSMLBlockTag)
 		if !ok {
 			break
 		}
+		sawWrapper = true
 		closeTag := "</" + name
 		end, ok := findDSMLClose(masked, start, closeTag)
 		if !ok {
@@ -133,12 +218,242 @@ func findDSMLBlocks(content string) []dsmlBlock {
 		}
 		i = end
 	}
+	if len(blocks) == 0 && !sawWrapper {
+		// Some models drop the wrapper element entirely and emit bare
+		// <..DSML..invoke> tags. Recover those too: the invoke element is
+		// self-describing, so the wrapper adds nothing but a failure mode.
+		//
+		// Only when no wrapper was seen at all: an unterminated wrapper must
+		// stay untouched, and treating the invokes inside it as bare would
+		// execute a block the model never closed.
+		blocks = findBareDSMLInvocations(content, masked)
+	}
 	return blocks
+}
+
+// findBareDSMLInvocations recovers invoke blocks that appear without a
+// tool_calls wrapper.
+func findBareDSMLInvocations(content, masked string) []dsmlBlock {
+	var blocks []dsmlBlock
+	for _, sp := range scanDSMLInvocations(masked) {
+		body := content[sp.start:sp.end]
+		if calls := parseDSMLInvocations(body); len(calls) > 0 {
+			blocks = append(blocks, dsmlBlock{start: sp.start, end: sp.end, calls: calls})
+		}
+	}
+	return blocks
+}
+
+// dsmlInvokeSpan is a matched invoke element, from its opener to just past its
+// closing tag, with the parameters the walk already validated.
+type dsmlInvokeSpan struct {
+	start, end int
+	name       string
+	params     []dsmlParamSpan
+}
+
+// dsmlParamSpan is a parameter the walk validated: its name and the exact range
+// of its value. Reusing these ranges is what keeps the parser from re-scanning
+// the body with rules that could drift from the walk's.
+type dsmlParamSpan struct {
+	name       string
+	isString   bool
+	valueStart int
+	valueEnd   int
+}
+
+// scanDSMLInvocations walks s once and returns the invoke elements that are
+// safe to execute, in document order.
+//
+// Invoke elements are siblings, but a model that emits DSML as text can leave
+// any of them unterminated. The rules below exist so that malformed output
+// degrades to "nothing runs" instead of "the wrong thing runs":
+//
+//   - An element that never closes is never returned. Its opener stays visible
+//     in the content.
+//   - A structural tag inside a parameter value means the parameter never
+//     closed: a value is text, and markup in it cannot be told apart from real
+//     markup. The invoke is not executed.
+//   - Anything opened while an abandoned element is still on the stack inherits
+//     that: its markup came from inside a value that never closed, so it is not
+//     executed either, however well-formed it looks.
+//
+// The third rule is what makes a value that quotes a complete call safe. A
+// value like `usa <invoke name="exec">…</invoke> y listo` is indistinguishable
+// from a real nested call, so treating it as text would mean executing whatever
+// it quotes. The cost is that a model documenting its own syntax loses that one
+// call; the block stays as text.
+func scanDSMLInvocations(s string) []dsmlInvokeSpan {
+	const (
+		frameInvoke = iota
+		frameParameter
+	)
+	type frame struct {
+		kind      int
+		start     int
+		tagEnd    int
+		abandoned bool
+		untrusted bool
+		params    []dsmlParamSpan
+	}
+
+	var stack []frame
+	var spans []dsmlInvokeSpan
+
+	// abandonParameters drops the pending parameter frames and marks the invoke
+	// that contained them as abandoned.
+	abandonParameters := func() {
+		for len(stack) > 0 && stack[len(stack)-1].kind == frameParameter {
+			stack = stack[:len(stack)-1]
+		}
+		if n := len(stack); n > 0 && stack[n-1].kind == frameInvoke {
+			stack[n-1].abandoned = true
+		}
+	}
+
+	for i := 0; i < len(s); {
+		if s[i] != '<' {
+			i++
+			continue
+		}
+		name, isClose, tagEnd, ok := parseDSMLTagAt(s, i)
+		if !ok {
+			i++
+			continue
+		}
+		top := -1
+		if len(stack) > 0 {
+			top = stack[len(stack)-1].kind
+		}
+		switch {
+		case !isClose && (name == "invoke" || name == "parameter"):
+			if top == frameParameter {
+				abandonParameters()
+			}
+			kind := frameInvoke
+			if name == "parameter" {
+				kind = frameParameter
+			}
+			// O(1): the parent already carries the taint, so it does not have
+			// to be recomputed by walking the stack.
+			untrusted := false
+			if len(stack) > 0 {
+				p := stack[len(stack)-1]
+				untrusted = p.abandoned || p.untrusted
+			}
+			stack = append(stack, frame{kind: kind, start: i, tagEnd: tagEnd, untrusted: untrusted})
+		case isClose && name == "parameter":
+			if top == frameParameter {
+				f := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				if n := len(stack); n > 0 && stack[n-1].kind == frameInvoke {
+					attrs := s[f.start:f.tagEnd]
+					stack[n-1].params = append(stack[n-1].params, dsmlParamSpan{
+						name:       dsmlAttr(attrs, "name"),
+						isString:   strings.EqualFold(dsmlAttr(attrs, "string"), "true"),
+						valueStart: f.tagEnd,
+						valueEnd:   i,
+					})
+				}
+			}
+		case isClose && name == "invoke":
+			// Drop any parameter still open inside this invoke: the parameter
+			// never closed, so the invoke's body cannot be attributed.
+			unterminated := false
+			for len(stack) > 0 && stack[len(stack)-1].kind == frameParameter {
+				stack = stack[:len(stack)-1]
+				unterminated = true
+			}
+			if n := len(stack); n > 0 && stack[n-1].kind == frameInvoke {
+				f := stack[n-1]
+				stack = stack[:n-1]
+				if !f.abandoned && !f.untrusted && !unterminated {
+					spans = append(spans, dsmlInvokeSpan{
+						start:  f.start,
+						end:    tagEnd,
+						name:   dsmlAttr(s[f.start:f.tagEnd], "name"),
+						params: f.params,
+					})
+				}
+			}
+		}
+		i = tagEnd
+	}
+	return spans
+}
+
+// parseDSMLTagAt parses a DSML opening or closing tag starting at s[start] ==
+// '<'. It reports the canonical element name, whether the tag is a closer, and
+// the offset just past the closing '>'.
+func parseDSMLTagAt(s string, start int) (name string, isClose bool, end int, ok bool) {
+	j := start + 1
+	if j < len(s) && s[j] == '/' {
+		isClose = true
+		j++
+	}
+	markerLen := dsmlMarkerLen(s, j)
+	if markerLen == 0 {
+		return "", false, 0, false
+	}
+	j += markerLen
+	for j < len(s) && s[j] == ' ' {
+		j++
+	}
+	name, j = readDSMLName(s, j)
+	if name == "" {
+		return "", false, 0, false
+	}
+	// findTagEnd honours quoted attribute values, so a '>' inside one does not
+	// truncate the tag.
+	end = findTagEnd(s, j)
+	if end < 0 {
+		return "", false, 0, false
+	}
+	return name, isClose, end, true
+}
+
+// findNextDSMLClose returns the offset just past the next closing tag for name
+// at or after from.
+func findNextDSMLClose(s string, from int, name string) (int, bool) {
+	want := normalizeDSMLName(name)
+	for i := from; i < len(s); i++ {
+		if s[i] != '<' {
+			continue
+		}
+		j := i + 1
+		if j < len(s) && s[j] == '/' {
+			j++
+		} else {
+			continue
+		}
+		markerLen := dsmlMarkerLen(s, j)
+		if markerLen == 0 {
+			continue
+		}
+		j += markerLen
+		for j < len(s) && s[j] == ' ' {
+			j++
+		}
+		got, j := readDSMLName(s, j)
+		if got == "" || got != want {
+			continue
+		}
+		for j < len(s) && s[j] != '>' {
+			if s[j] == '\n' {
+				break
+			}
+			j++
+		}
+		if j < len(s) && s[j] == '>' {
+			return j + 1, true
+		}
+	}
+	return 0, false
 }
 
 func isDSMLBlockTag(name string) bool {
 	switch name {
-	case "tool_calls", "tool_call", "function_calls":
+	case "tool_calls", "tool_call", "function_calls", "function_call":
 		return true
 	}
 	return false
@@ -173,14 +488,10 @@ func parseDSMLOpenTag(s string, start int) (name string, end int, ok bool) {
 	for j < len(s) && s[j] == ' ' {
 		j++
 	}
-	nameStart := j
-	for j < len(s) && isDSMLNameByte(s[j]) {
-		j++
-	}
-	if j == nameStart {
+	name, j = readDSMLName(s, j)
+	if name == "" {
 		return "", 0, false
 	}
-	name = s[nameStart:j]
 	// Skip attributes up to '>'
 	for j < len(s) && s[j] != '>' {
 		if s[j] == '\n' {
@@ -223,7 +534,7 @@ func markerLenOrZero(j, i int, consumed bool, s string) int {
 		return 0
 	}
 	// Optional "DSML" spelling right after the marker(s).
-	if strings.HasPrefix(s[j:], "DSML") {
+	if len(s) >= j+len("DSML") && strings.EqualFold(s[j:j+len("DSML")], "DSML") {
 		j += len("DSML")
 		// Trailing marker(s) after DSML, e.g. doubled fullwidth pipe.
 		for j < len(s) {
@@ -245,113 +556,43 @@ func isDSMLNameByte(b byte) bool {
 	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
 }
 
-// findDSMLClose finds the closing tag for name starting at or after from.
+// findDSMLClose finds the closing tag for closeTag (e.g. "</invoke") starting at
+// or after from. It is the closeTag-flavoured spelling of findNextDSMLClose.
 func findDSMLClose(s string, from int, closeTag string) (int, bool) {
-	want := strings.TrimPrefix(closeTag, "</")
-	for i := from; i < len(s); i++ {
-		if s[i] != '<' {
-			continue
-		}
-		j := i + 1
-		if j < len(s) && s[j] == '/' {
-			j++
-		} else {
-			continue
-		}
-		markerLen := dsmlMarkerLen(s, j)
-		if markerLen == 0 {
-			continue
-		}
-		j += markerLen
-		for j < len(s) && s[j] == ' ' {
-			j++
-		}
-		if strings.HasPrefix(s[j:], want) {
-			k := j + len(want)
-			for k < len(s) && s[k] != '>' {
-				k++
-			}
-			if k < len(s) {
-				return k + 1, true
-			}
-		}
-	}
-	return 0, false
+	return findNextDSMLClose(s, from, strings.TrimPrefix(closeTag, "</"))
 }
 
-// parseDSMLInvocations extracts every invoke block.
+// parseDSMLInvocations extracts every invoke the walk validated, using the
+// parameter ranges it already resolved. Re-scanning the body here would apply a
+// second set of rules, and the two would drift apart.
 func parseDSMLInvocations(body string) []protocoltypes.ToolCall {
 	var calls []protocoltypes.ToolCall
-	i := 0
-	for {
-		start, _, ok := findNextDSMLTag(body, i, func(n string) bool { return n == "invoke" })
-		if !ok {
-			break
+	for _, sp := range scanDSMLInvocations(body) {
+		if sp.name == "" {
+			continue
 		}
-		openEnd := findTagEnd(body, start)
-		if openEnd < 0 {
-			break
-		}
-		attrs := body[start:openEnd]
-		toolName := dsmlAttr(attrs, "name")
-		end, ok := findDSMLClose(body, openEnd, "</invoke")
-		if !ok {
-			break
-		}
-		inner := body[openEnd:end]
-		if toolName != "" {
-			if args := parseDSMLParameters(inner); args != nil {
-				calls = append(calls, protocoltypes.ToolCall{
-					ID:        newDSMLCallID(len(calls)),
-					Type:      "function",
-					Name:      toolName,
-					Arguments: args,
-					Function: &protocoltypes.FunctionCall{
-						Name:      toolName,
-						Arguments: mustJSON(args),
-					},
-				})
+		args := map[string]any{}
+		for _, ps := range sp.params {
+			if ps.name == "" {
+				continue
 			}
+			args[ps.name] = dsmlParamValue(body[ps.valueStart:ps.valueEnd], ps.isString)
 		}
-		i = end
+		if len(args) == 0 {
+			continue
+		}
+		calls = append(calls, protocoltypes.ToolCall{
+			ID:        newDSMLCallID(len(calls)),
+			Type:      "function",
+			Name:      sp.name,
+			Arguments: args,
+			Function: &protocoltypes.FunctionCall{
+				Name:      sp.name,
+				Arguments: mustJSON(args),
+			},
+		})
 	}
 	return calls
-}
-
-// parseDSMLParameters extracts parameter elements.
-func parseDSMLParameters(inner string) map[string]any {
-	args := map[string]any{}
-	i := 0
-	for {
-		start, _, ok := findNextDSMLTag(inner, i, func(n string) bool { return n == "parameter" })
-		if !ok {
-			break
-		}
-		openEnd := findTagEnd(inner, start)
-		if openEnd < 0 {
-			break
-		}
-		attrs := inner[start:openEnd]
-		paramName := dsmlAttr(attrs, "name")
-		isString := strings.EqualFold(dsmlAttr(attrs, "string"), "true")
-		end, ok := findDSMLClose(inner, openEnd, "</parameter")
-		if !ok {
-			break
-		}
-		raw := inner[openEnd:end]
-		// Trim the closing tag from raw.
-		if idx := strings.LastIndex(raw, "</"); idx >= 0 {
-			raw = raw[:idx]
-		}
-		if paramName != "" {
-			args[paramName] = dsmlParamValue(raw, isString)
-		}
-		i = end
-	}
-	if len(args) == 0 {
-		return nil
-	}
-	return args
 }
 
 // dsmlParamValue decodes a parameter value. Values flagged string="true" are
